@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::{http::Request, Message}};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::config::{KALSHI_WS_URL, KALSHI_API_BASE, KALSHI_API_DELAY_MS};
 use crate::execution::NanoClock;
@@ -92,6 +92,50 @@ impl<'a> KalshiOrderRequest<'a> {
             client_order_id,
             expiration_ts: None,
             time_in_force: Some("immediate_or_cancel"),
+        }
+    }
+
+    /// Create a resting limit BUY order (stays on book until filled/cancelled)
+    pub fn limit_buy(ticker: Cow<'a, str>, side: &'static str, price_cents: i64, count: i64, client_order_id: Cow<'a, str>) -> Self {
+        let (yes_price, no_price) = if side == "yes" {
+            (Some(price_cents), None)
+        } else {
+            (None, Some(price_cents))
+        };
+
+        Self {
+            ticker,
+            action: "buy",
+            side,
+            order_type: "limit",
+            count,
+            yes_price,
+            no_price,
+            client_order_id,
+            expiration_ts: None,
+            time_in_force: None, // GTC - rests on book
+        }
+    }
+
+    /// Create a resting limit SELL order (stays on book until filled/cancelled)
+    pub fn limit_sell(ticker: Cow<'a, str>, side: &'static str, price_cents: i64, count: i64, client_order_id: Cow<'a, str>) -> Self {
+        let (yes_price, no_price) = if side == "yes" {
+            (Some(price_cents), None)
+        } else {
+            (None, Some(price_cents))
+        };
+
+        Self {
+            ticker,
+            action: "sell",
+            side,
+            order_type: "limit",
+            count,
+            yes_price,
+            no_price,
+            client_order_id,
+            expiration_ts: None,
+            time_in_force: None, // GTC - rests on book
         }
     }
 }
@@ -371,6 +415,92 @@ impl KalshiApiClient {
         debug!("[KALSHI] {} filled={}", resp.order.status, resp.order.filled_count());
         Ok(resp)
     }
+
+    /// Create a resting limit BUY order (stays on book until filled/cancelled)
+    pub async fn buy_limit(
+        &self,
+        ticker: &str,
+        side: &str,  // "yes" or "no"
+        price_cents: i64,
+        count: i64,
+    ) -> Result<KalshiOrderResponse> {
+        debug_assert!(!ticker.is_empty(), "ticker must not be empty");
+        debug_assert!(price_cents >= 1 && price_cents <= 99, "price must be 1-99");
+        debug_assert!(count >= 1, "count must be >= 1");
+
+        let side_static: &'static str = if side == "yes" { "yes" } else { "no" };
+        let order_id = Self::next_order_id();
+        let order = KalshiOrderRequest::limit_buy(
+            Cow::Borrowed(ticker),
+            side_static,
+            price_cents,
+            count,
+            Cow::Borrowed(&order_id)
+        );
+        info!("[KALSHI] LIMIT BUY {} {} @{}¢ x{}", side, ticker, price_cents, count);
+
+        let resp = self.create_order(&order).await?;
+        info!("[KALSHI] order_id={} status={}", resp.order.order_id, resp.order.status);
+        Ok(resp)
+    }
+
+    /// Cancel an order by order_id
+    pub async fn cancel_order(&self, order_id: &str) -> Result<()> {
+        let path = format!("/portfolio/orders/{}", order_id);
+        let url = format!("{}{}", KALSHI_API_BASE, path);
+        let timestamp_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let full_path = format!("/trade-api/v2{}", path);
+        let msg = format!("{}DELETE{}", timestamp_ms, full_path);
+        let signature = self.config.sign(&msg)?;
+
+        let resp = self.http
+            .delete(&url)
+            .header("KALSHI-ACCESS-KEY", &self.config.api_key_id)
+            .header("KALSHI-ACCESS-SIGNATURE", &signature)
+            .header("KALSHI-ACCESS-TIMESTAMP", timestamp_ms.to_string())
+            .timeout(ORDER_TIMEOUT)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Cancel order failed {}: {}", status, body);
+        }
+        debug!("[KALSHI] Cancelled order {}", order_id);
+        Ok(())
+    }
+
+    /// Get all open/resting orders
+    pub async fn get_open_orders(&self) -> Result<Vec<KalshiOrderDetails>> {
+        let path = "/portfolio/orders?status=resting";
+        let resp: GetOrdersResponse = self.get(path).await?;
+        Ok(resp.orders)
+    }
+
+    /// Cancel all open orders (optionally for a specific ticker)
+    pub async fn cancel_all_orders(&self, ticker: Option<&str>) -> Result<u32> {
+        let orders = self.get_open_orders().await?;
+        let mut cancelled = 0;
+        for order in orders {
+            if ticker.is_none() || order.ticker == ticker.unwrap() {
+                if let Err(e) = self.cancel_order(&order.order_id).await {
+                    warn!("[KALSHI] Failed to cancel {}: {}", order.order_id, e);
+                } else {
+                    cancelled += 1;
+                }
+            }
+        }
+        Ok(cancelled)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct GetOrdersResponse {
+    orders: Vec<KalshiOrderDetails>,
 }
 
 // === WebSocket Message Types ===
