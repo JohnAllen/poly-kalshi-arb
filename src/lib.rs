@@ -5,6 +5,7 @@ pub mod circuit_breaker;
 pub mod config;
 pub mod discovery;
 pub mod execution;
+pub mod fair_value;
 pub mod kalshi;
 pub mod polymarket;
 pub mod polymarket_clob;

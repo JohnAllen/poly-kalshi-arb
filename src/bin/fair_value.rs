@@ -114,6 +114,7 @@ pub fn calc_expected_move(spot: f64, minutes_remaining: f64, annual_vol: f64) ->
 }
 
 /// Calculate delta (sensitivity to spot price change)
+/// Returns: probability change per $1 spot move (very small number)
 pub fn calc_delta(spot: f64, strike: f64, minutes_remaining: f64, annual_vol: f64) -> f64 {
     if minutes_remaining <= 0.0 || annual_vol <= 0.0 {
         return 0.0;
@@ -125,6 +126,87 @@ pub fn calc_delta(spot: f64, strike: f64, minutes_remaining: f64, annual_vol: f6
     let d2 = (log_ratio - 0.5 * annual_vol.powi(2) * time_years) / (annual_vol * sqrt_t);
 
     norm_pdf(d2) / (spot * annual_vol * sqrt_t)
+}
+
+/// Calculate delta in cents per $100 spot move
+/// This is a more practical measure for trading 15-min crypto options
+///
+/// Example: If delta_cents_per_100 = 2.5, then a $100 move in BTC
+/// will change the option value by ~2.5 cents.
+///
+/// For BTC at $100k with 15min, $100 is ~0.1% move
+pub fn calc_delta_cents_per_100(spot: f64, strike: f64, minutes_remaining: f64, annual_vol: f64) -> f64 {
+    let delta = calc_delta(spot, strike, minutes_remaining, annual_vol);
+    // delta is prob change per $1, multiply by 100 for cents, then by 100 for $100 move
+    delta * 100.0 * 100.0
+}
+
+/// Calculate the dollar move needed to change option value by X cents
+/// This answers: "How far does BTC need to move for this option to gain/lose X cents?"
+pub fn calc_move_for_cents(spot: f64, strike: f64, minutes_remaining: f64, annual_vol: f64, target_cents: f64) -> f64 {
+    let delta = calc_delta(spot, strike, minutes_remaining, annual_vol);
+    if delta <= 0.0 {
+        return f64::INFINITY;
+    }
+    // delta is prob change per $1, target_cents/100 is the prob change we want
+    (target_cents / 100.0) / delta
+}
+
+/// Binary option delta structure with all practical delta measures
+#[derive(Debug, Clone)]
+pub struct BinaryDelta {
+    /// Raw delta: probability change per $1 spot move
+    pub raw: f64,
+    /// Cents change per $1 spot move
+    pub cents_per_dollar: f64,
+    /// Cents change per $100 spot move (practical for BTC)
+    pub cents_per_100: f64,
+    /// Cents change per $1000 spot move
+    pub cents_per_1000: f64,
+    /// Dollar move needed to change value by 1 cent
+    pub dollars_for_1_cent: f64,
+    /// Dollar move needed to change value by 5 cents
+    pub dollars_for_5_cents: f64,
+    /// Percentage spot move needed for 1 cent change
+    pub pct_for_1_cent: f64,
+    /// Direction: positive = YES benefits from spot up, negative = YES benefits from spot down
+    pub direction: i8,
+}
+
+impl BinaryDelta {
+    pub fn calculate(spot: f64, strike: f64, minutes_remaining: f64, annual_vol: f64) -> Self {
+        let raw = calc_delta(spot, strike, minutes_remaining, annual_vol);
+        let cents_per_dollar = raw * 100.0;
+        let cents_per_100 = cents_per_dollar * 100.0;
+        let cents_per_1000 = cents_per_dollar * 1000.0;
+
+        let dollars_for_1_cent = if raw > 0.0 { 0.01 / raw } else { f64::INFINITY };
+        let dollars_for_5_cents = if raw > 0.0 { 0.05 / raw } else { f64::INFINITY };
+        let pct_for_1_cent = if raw > 0.0 && spot > 0.0 {
+            (0.01 / raw) / spot * 100.0
+        } else {
+            f64::INFINITY
+        };
+
+        // YES delta is always positive for "above" markets (spot up = YES up)
+        let direction = 1;
+
+        Self {
+            raw,
+            cents_per_dollar,
+            cents_per_100,
+            cents_per_1000,
+            dollars_for_1_cent,
+            dollars_for_5_cents,
+            pct_for_1_cent,
+            direction,
+        }
+    }
+
+    /// Get the expected option value change for a given spot move
+    pub fn value_change_cents(&self, spot_move: f64) -> f64 {
+        self.cents_per_dollar * spot_move
+    }
 }
 
 /// Calculate gamma (rate of change of delta)
@@ -149,7 +231,8 @@ fn print_analysis(spot: f64, strike: f64, minutes: f64, vol: f64) {
     let (yes_prob, no_prob) = calc_fair_value(spot, strike, minutes, vol);
     let (yes_cents, no_cents) = calc_fair_value_cents(spot, strike, minutes, vol);
     let (move_pct, move_dollars) = calc_expected_move(spot, minutes, vol);
-    let delta = calc_delta(spot, strike, minutes, vol);
+    let delta = BinaryDelta::calculate(spot, strike, minutes, vol);
+    let gamma = calc_gamma(spot, strike, minutes, vol);
 
     let moneyness = if (spot - strike).abs() < 0.01 * spot {
         "ATM (At-The-Money)"
@@ -180,10 +263,17 @@ fn print_analysis(spot: f64, strike: f64, minutes: f64, vol: f64) {
     println!("║   │  Total:            {:>6.2}%   =  {:>3}¢                              │   ║", (yes_prob + no_prob) * 100.0, yes_cents + no_cents);
     println!("║   └─────────────────────────────────────────────────────────────────────┘   ║");
     println!("╠══════════════════════════════════════════════════════════════════════════════╣");
-    println!("║ GREEKS & EXPECTED MOVE:                                                      ║");
-    println!("║   Delta:             {:>8.4} (¢ per $1 spot move)                          ║", delta * 100.0);
+    println!("║ DELTA (Option Sensitivity):                                                  ║");
+    println!("║   ¢ per $100 move:   {:>8.2}¢  (BTC moves $100 → option changes this much) ║", delta.cents_per_100);
+    println!("║   ¢ per $1000 move:  {:>8.2}¢  (BTC moves $1000 → option changes this much)║", delta.cents_per_1000);
+    println!("║   $ for 1¢ change:   ${:>8.0}   (spot move needed for 1¢ option change)    ║", delta.dollars_for_1_cent);
+    println!("║   $ for 5¢ change:   ${:>8.0}   (spot move needed for 5¢ option change)    ║", delta.dollars_for_5_cents);
+    println!("║   % for 1¢ change:   {:>8.3}%  (% spot move for 1¢ option change)          ║", delta.pct_for_1_cent);
+    println!("╠══════════════════════════════════════════════════════════════════════════════╣");
+    println!("║ EXPECTED MOVE & GAMMA:                                                       ║");
     println!("║   Expected 1σ Move:  {:>6.3}% (${:.2})                                      ║", move_pct, move_dollars);
     println!("║   68% Range:         ${:.2} - ${:.2}                               ║", spot - move_dollars, spot + move_dollars);
+    println!("║   Gamma (raw):       {:>12.8}  (delta acceleration)                    ║", gamma);
     println!("╠══════════════════════════════════════════════════════════════════════════════╣");
     println!("║ TRADING GUIDANCE:                                                            ║");
 

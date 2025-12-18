@@ -17,6 +17,7 @@
 //!   KALSHI_PRIVATE_KEY_PATH - Path to your Kalshi private key PEM file
 
 use anyhow::{Context, Result};
+use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -257,55 +258,31 @@ fn get_resolution(market: &Market) -> Option<bool> {
 
 // === Main ===
 
-#[derive(Debug)]
+#[derive(Parser, Debug)]
+#[command(name = "resolution_analysis")]
+#[command(about = "Analyze Kalshi crypto market resolution rates (YES vs NO)")]
 struct Args {
+    /// Series to analyze (can specify multiple, e.g., -s KXBTC15M -s KXETH15M)
+    #[arg(short, long)]
     series: Vec<String>,
+
+    /// Max events to fetch per series
+    #[arg(short, long, default_value = "1000")]
     limit: u32,
-}
 
-fn parse_args() -> Args {
-    let args: Vec<String> = std::env::args().collect();
-    let mut i = 1;
-
-    let mut series = Vec::new();
-    let mut limit = 1000u32;
-
-    while i < args.len() {
-        match args[i].as_str() {
-            "--series" | "-s" => {
-                i += 1;
-                if i < args.len() {
-                    series.push(args[i].clone());
-                }
-            }
-            "--limit" | "-l" => {
-                i += 1;
-                if i < args.len() {
-                    limit = args[i].parse().unwrap_or(1000);
-                }
-            }
-            "--help" | "-h" => {
-                println!("Usage: resolution_analysis [--series SERIES] [--limit N]");
-                println!("  --series, -s   Series to analyze (can specify multiple)");
-                println!("                 Default: KXBTC15M and KXETH15M");
-                println!("  --limit, -l    Max events per series (default: 1000)");
-                std::process::exit(0);
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-
-    if series.is_empty() {
-        series = vec![BTC_SERIES.to_string(), ETH_SERIES.to_string()];
-    }
-
-    Args { series, limit }
+    /// Export raw market data to CSV file
+    #[arg(long)]
+    csv: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = parse_args();
+    let mut args = Args::parse();
+
+    // Default to both series if none specified
+    if args.series.is_empty() {
+        args.series = vec![BTC_SERIES.to_string(), ETH_SERIES.to_string()];
+    }
 
     println!("╔════════════════════════════════════════════════════════════════════════════╗");
     println!("║           KALSHI CRYPTO MARKET RESOLUTION ANALYSIS                         ║");
@@ -324,6 +301,9 @@ async fn main() -> Result<()> {
     // Strike price buckets (relative to hypothetical spot)
     // For crypto, we'll track absolute strike values
     let mut strike_resolution: HashMap<String, (u32, u32)> = HashMap::new(); // strike_bucket -> (yes_count, total)
+
+    // Collect all markets for CSV export
+    let mut all_markets: Vec<Market> = Vec::new();
 
     for series in &args.series {
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -346,6 +326,9 @@ async fn main() -> Result<()> {
                 if market.status != "settled" && market.status != "finalized" {
                     continue;
                 }
+
+                // Collect for CSV export
+                all_markets.push(market.clone());
 
                 stats.total_markets += 1;
                 overall_stats.total_markets += 1;
@@ -540,6 +523,48 @@ async fn main() -> Result<()> {
             };
             println!("{:30} {:>10} {:>10} {:>11.1}%", bucket, yes, total, rate);
         }
+    }
+
+    // Export to CSV if requested
+    if let Some(csv_path) = &args.csv {
+        use std::io::Write;
+        let mut file = std::fs::File::create(csv_path)
+            .context(format!("Failed to create CSV file: {}", csv_path))?;
+
+        // Write header
+        writeln!(file, "ticker,event_ticker,title,status,result,strike,volume,close_time,expiration_time")?;
+
+        // Write each market
+        for market in &all_markets {
+            let strike = parse_strike_from_title(&market.title)
+                .or(market.floor_strike)
+                .map(|s| format!("{:.0}", s))
+                .unwrap_or_default();
+            let result = market.result.as_deref().unwrap_or("");
+            let volume = market.volume.unwrap_or(0);
+            let close_time = market.close_time.as_deref().unwrap_or("");
+            let expiration_time = market.expiration_time.as_deref().unwrap_or("");
+
+            // Escape title (may contain commas)
+            let title_escaped = market.title.replace('"', "\"\"");
+
+            writeln!(
+                file,
+                "{},{},\"{}\",{},{},{},{},{},{}",
+                market.ticker,
+                market.event_ticker,
+                title_escaped,
+                market.status,
+                result,
+                strike,
+                volume,
+                close_time,
+                expiration_time
+            )?;
+        }
+
+        println!();
+        println!("Exported {} markets to {}", all_markets.len(), csv_path);
     }
 
     println!();

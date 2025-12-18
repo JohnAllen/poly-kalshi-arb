@@ -458,7 +458,14 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = parse_args();
+    let args = Args::parse();
+
+    // Parse timestamps if provided
+    let start_ts = args.start.as_ref().and_then(|s| parse_timestamp(s).ok());
+    let end_ts = args.end.as_ref().and_then(|s| parse_timestamp(s).ok());
+
+    // Default to markets if nothing specified
+    let fetch_markets = args.markets || (!args.trades && !args.history);
 
     // Load Kalshi credentials
     let config = KalshiConfig::from_env().context("Failed to load Kalshi credentials")?;
@@ -471,23 +478,23 @@ async fn main() -> Result<()> {
         eprintln!("Ticker: {}", ticker);
     }
     eprintln!("Limit: {}", args.limit);
-    eprintln!("Output: {}", args.output_format);
+    eprintln!("Output: {}", args.output);
     eprintln!();
 
     // Fetch markets
-    if args.fetch_markets {
+    if fetch_markets {
         eprintln!("Fetching markets for series {}...", args.series);
         let markets = client.get_series_markets(&args.series, &args.status, args.limit).await?;
         eprintln!("Found {} markets", markets.len());
 
-        match args.output_format.as_str() {
+        match args.output.as_str() {
             "csv" => println!("{}", markets_to_csv(&markets)),
             _ => println!("{}", serde_json::to_string_pretty(&markets)?),
         }
     }
 
     // Fetch trades (ticker optional - will get all trades if not specified)
-    if args.fetch_trades {
+    if args.trades {
         let ticker_ref = args.ticker.as_deref();
 
         if let Some(t) = ticker_ref {
@@ -495,26 +502,26 @@ async fn main() -> Result<()> {
         } else {
             eprintln!("Fetching all trades...");
         }
-        let trades = client.get_all_trades(ticker_ref, args.limit, args.start_ts, args.end_ts).await?;
+        let trades = client.get_all_trades(ticker_ref, args.limit, start_ts, end_ts).await?;
         eprintln!("Found {} trades", trades.len());
 
-        match args.output_format.as_str() {
+        match args.output.as_str() {
             "csv" => println!("{}", trades_to_csv(&trades)),
             _ => println!("{}", serde_json::to_string_pretty(&trades)?),
         }
     }
 
     // Fetch history (requires ticker)
-    if args.fetch_history {
+    if args.history {
         let ticker = args.ticker.as_ref().ok_or_else(|| {
             anyhow::anyhow!("--history requires --ticker <TICKER>")
         })?;
 
         eprintln!("Fetching price history for {}...", ticker);
-        let resp = client.get_market_history(ticker, args.limit, None, args.start_ts, args.end_ts).await?;
+        let resp = client.get_market_history(ticker, args.limit, None, start_ts, end_ts).await?;
         eprintln!("Found {} history points", resp.history.len());
 
-        match args.output_format.as_str() {
+        match args.output.as_str() {
             "csv" => println!("{}", history_to_csv(&resp.history)),
             _ => println!("{}", serde_json::to_string_pretty(&resp.history)?),
         }

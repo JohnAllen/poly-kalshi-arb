@@ -19,13 +19,65 @@ const POLYGON_CRYPTO_WS_URL: &str = "wss://socket.polygon.io/crypto";
 /// Local price server URL
 const LOCAL_PRICE_SERVER: &str = "ws://127.0.0.1:9999";
 
-/// Shared price state
+/// Shared price state with history for spike detection
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct PriceState {
     pub btc_price: Option<f64>,
     pub eth_price: Option<f64>,
     #[serde(default)]
     pub timestamp: Option<i64>,
+    // Recent price history for spike detection
+    #[serde(skip)]
+    pub btc_history: Vec<f64>,
+    #[serde(skip)]
+    pub eth_history: Vec<f64>,
+    #[serde(skip)]
+    pub spike_cooldown_until: Option<std::time::Instant>,
+}
+
+const PRICE_HISTORY_SIZE: usize = 10;
+const SPIKE_THRESHOLD_PCT: f64 = 0.3; // 0.3% deviation from avg triggers cooldown
+const SPIKE_COOLDOWN_MS: u64 = 1000; // 1 second cooldown
+
+impl PriceState {
+    pub fn update_btc(&mut self, price: f64) {
+        let history = self.btc_history.clone();
+        self.check_spike(price, &history);
+        self.btc_history.push(price);
+        if self.btc_history.len() > PRICE_HISTORY_SIZE {
+            self.btc_history.remove(0);
+        }
+        self.btc_price = Some(price);
+    }
+
+    pub fn update_eth(&mut self, price: f64) {
+        let history = self.eth_history.clone();
+        self.check_spike(price, &history);
+        self.eth_history.push(price);
+        if self.eth_history.len() > PRICE_HISTORY_SIZE {
+            self.eth_history.remove(0);
+        }
+        self.eth_price = Some(price);
+    }
+
+    fn check_spike(&mut self, current: f64, history: &[f64]) {
+        if history.len() < 3 {
+            return; // Need some history first
+        }
+        let avg: f64 = history.iter().sum::<f64>() / history.len() as f64;
+        let deviation_pct = ((current - avg) / avg).abs() * 100.0;
+        if deviation_pct > SPIKE_THRESHOLD_PCT {
+            warn!("[SPIKE] Price spike detected! Current={:.2} Avg={:.2} Dev={:.3}% - pausing 1s",
+                  current, avg, deviation_pct);
+            self.spike_cooldown_until = Some(std::time::Instant::now() + std::time::Duration::from_millis(SPIKE_COOLDOWN_MS));
+        }
+    }
+
+    pub fn is_spike_cooldown(&self) -> bool {
+        self.spike_cooldown_until
+            .map(|t| std::time::Instant::now() < t)
+            .unwrap_or(false)
+    }
 }
 
 /// Auth message for Polygon
@@ -204,10 +256,10 @@ async fn polygon_stream(prices: Arc<RwLock<PriceState>>, api_key: &str) -> anyho
                                 let mut state = prices.write().await;
                                 match pair.as_str() {
                                     "BTC-USD" => {
-                                        state.btc_price = Some(price);
+                                        state.update_btc(price);
                                     }
                                     "ETH-USD" => {
-                                        state.eth_price = Some(price);
+                                        state.update_eth(price);
                                     }
                                     _ => {}
                                 }

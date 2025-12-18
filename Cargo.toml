@@ -29,6 +29,7 @@ nonzero_ext = "0.3"
 arrayvec = "0.7"
 wide = "0.7"
 clap = { version = "4.4", features = ["derive"] }
+regex-lite = "0.1"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -73,6 +74,14 @@ path = "src/bin/strike_input.rs"
 [[bin]]
 name = "atm_sniper"
 path = "src/bin/atm_sniper.rs"
+
+[[bin]]
+name = "poly_sniper"
+path = "src/bin/poly_sniper.rs"
+
+[[bin]]
+name = "dual_monitor"
+path = "src/bin/dual_monitor.rs"
 
 [profile.release]
 opt-level = 3
