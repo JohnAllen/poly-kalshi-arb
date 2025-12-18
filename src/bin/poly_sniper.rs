@@ -352,12 +352,19 @@ async fn discover_markets(market_filter: Option<&str>) -> Result<Vec<Market>> {
                     continue;
                 }
 
+                // Try to parse strike from question
+                let strike = parse_strike_from_question(&question);
+
+                info!("[DISCOVER] Found: {} | strike={:?} | expiry={:.1?}min | cid={}",
+                      &question[..question.len().min(60)], strike, expiry_minutes,
+                      &cid[..cid.len().min(20)]);
+
                 markets.push(Market {
                     condition_id: cid,
                     question,
                     yes_token: token_ids[0].clone(),
                     no_token: token_ids[1].clone(),
-                    strike: None, // Up/Down markets don't have strikes
+                    strike,
                     asset: asset.to_string(),
                     expiry_minutes,
                     yes_ask: None,
@@ -506,12 +513,28 @@ async fn run_polygon_feed(state: Arc<RwLock<State>>, api_key: &str) {
                             let Some(price) = m.p else { continue };
 
                             let mut s = state.write().await;
-                            if pair == "BTC-USD" {
+                            let old_price = if pair == "BTC-USD" {
+                                let old = s.prices.btc_price;
                                 s.prices.btc_price = Some(price);
+                                old
                             } else if pair == "ETH-USD" {
+                                let old = s.prices.eth_price;
                                 s.prices.eth_price = Some(price);
-                            }
+                                old
+                            } else {
+                                None
+                            };
                             s.prices.last_update = Some(std::time::Instant::now());
+
+                            // Log price updates (only when changed significantly)
+                            if let Some(old) = old_price {
+                                let pct_change = ((price - old) / old * 100.0).abs();
+                                if pct_change > 0.01 {
+                                    info!("[PRICE] {} ${:.2} -> ${:.2} ({:+.3}%)", pair, old, price, (price - old) / old * 100.0);
+                                }
+                            } else {
+                                info!("[PRICE] {} initial: ${:.2}", pair, price);
+                            }
                         }
                     }
                 }
@@ -922,42 +945,64 @@ async fn main() -> Result<()> {
                           spot_btc, spot_eth, s.markets.len(), s.kalshi_markets.len());
 
                     // Show Polymarket markets
+                    info!("───────────────────────────────────────────────────────────────────");
                     for (id, market) in &s.markets {
                         let pos = s.positions.get(id).cloned().unwrap_or_default();
 
                         // Get spot for this market's asset
-                        let spot = if market.asset == "ETH" {
-                            s.prices.eth_price
-                        } else {
-                            s.prices.btc_price
+                        let spot = match market.asset.as_str() {
+                            "ETH" => s.prices.eth_price,
+                            "BTC" => s.prices.btc_price,
+                            _ => s.prices.btc_price, // SOL/XRP use BTC as proxy for now
                         };
 
                         // Calculate fair value if we have data
-                        let (fair_yes, fair_no) = match (spot, market.strike, market.expiry_minutes) {
+                        let (fair_yes, fair_no, fair_source) = match (spot, market.strike, market.expiry_minutes) {
                             (Some(s), Some(k), Some(mins)) if mins > 0.0 => {
-                                calc_fair_value_cents(s, k, mins, vol)
+                                let (y, n) = calc_fair_value_cents(s, k, mins, vol);
+                                (y, n, format!("BS(spot={:.0},K={:.0},T={:.1}m)", s, k, mins))
                             }
-                            _ => (50, 50),
+                            (None, Some(k), Some(mins)) => {
+                                (50, 50, format!("NO_SPOT(K={:.0},T={:.1}m)", k, mins))
+                            }
+                            (Some(s), None, Some(mins)) => {
+                                (50, 50, format!("NO_STRIKE(spot={:.0},T={:.1}m) - up/down mkt", s, mins))
+                            }
+                            (_, _, None) => {
+                                (50, 50, "NO_EXPIRY".to_string())
+                            }
+                            _ => (50, 50, "MISSING_DATA".to_string()),
                         };
 
                         let yes_ask = market.yes_ask.unwrap_or(100);
                         let no_ask = market.no_ask.unwrap_or(100);
+                        let yes_bid = market.yes_bid.unwrap_or(0);
+                        let no_bid = market.no_bid.unwrap_or(0);
                         let yes_edge = fair_yes - yes_ask;
                         let no_edge = fair_no - no_ask;
 
                         let edge_str = if yes_edge >= edge || no_edge >= edge {
-                            format!("✓ EDGE Y:{:+}¢ N:{:+}¢", yes_edge, no_edge)
+                            format!("🔥 EDGE Y:{:+}¢ N:{:+}¢", yes_edge, no_edge)
                         } else {
                             format!("Y:{:+}¢ N:{:+}¢", yes_edge, no_edge)
                         };
 
-                        info!("  [POLY] {} | Fair Y={}¢ N={}¢ | Mkt Y={}¢ N={}¢ | {} | Pos: Y={:.1} N={:.1}",
-                              market.asset,
-                              fair_yes, fair_no,
-                              yes_ask, no_ask,
-                              edge_str,
-                              pos.yes_qty, pos.no_qty);
+                        // Truncate question for display
+                        let q_short = if market.question.len() > 50 {
+                            format!("{}...", &market.question[..47])
+                        } else {
+                            market.question.clone()
+                        };
+
+                        info!("  [{}] {}", market.asset, q_short);
+                        info!("      Book: Y={}/{} N={}/{} | Fair: Y={}¢ N={}¢ | {}",
+                              yes_bid, yes_ask, no_bid, no_ask,
+                              fair_yes, fair_no, edge_str);
+                        info!("      FV: {} | Pos: Y={:.1} N={:.1} | exp={:.1}m",
+                              fair_source, pos.yes_qty, pos.no_qty,
+                              market.expiry_minutes.unwrap_or(0.0));
                     }
+                    info!("───────────────────────────────────────────────────────────────────");
 
                     // Show Kalshi markets
                     for (ticker, kalshi) in &s.kalshi_markets {
@@ -1046,86 +1091,121 @@ async fn main() -> Result<()> {
                                     // Calculate fair value
                                     // For Up/Down markets (no strike), fair value is 50/50
                                     // For above/below strike markets, use Black-Scholes
-                                    let (fair_yes, fair_no) = match (spot, strike, expiry) {
+                                    let (fair_yes, fair_no, skip_reason) = match (spot, strike, expiry) {
                                         (Some(s), Some(k), Some(mins)) if mins > 0.0 => {
-                                            calc_fair_value_cents(s, k, mins, vol)
+                                            let (y, n) = calc_fair_value_cents(s, k, mins, vol);
+                                            (y, n, None)
                                         }
-                                        (_, None, _) => (50, 50), // Up/Down markets = 50/50
-                                        _ => continue,
+                                        (_, None, _) => (50, 50, Some("up/down market (no strike)")), // Up/Down markets = 50/50
+                                        (None, _, _) => (50, 50, Some("no spot price")),
+                                        (_, _, None) => (50, 50, Some("no expiry")),
+                                        (_, _, Some(mins)) if mins <= 0.0 => (50, 50, Some("expired")),
+                                        _ => (50, 50, Some("unknown")),
                                     };
 
                                     // Check for edge
                                     let yes_edge_actual = yes_ask_price.map(|a| fair_yes - a).unwrap_or(0);
                                     let no_edge_actual = no_ask_price.map(|a| fair_no - a).unwrap_or(0);
 
+                                    // Log orderbook updates with edge info
+                                    let side = if is_yes { "YES" } else { "NO" };
+                                    let (ask_p, bid_p) = if is_yes {
+                                        (yes_ask_price, best_bid.map(|(p,_)| p))
+                                    } else {
+                                        (no_ask_price, best_bid.map(|(p,_)| p))
+                                    };
+
+                                    // Only log significant updates (when there's potential edge or book changed meaningfully)
+                                    let this_edge = if is_yes { yes_edge_actual } else { no_edge_actual };
+                                    if this_edge > 0 || skip_reason.is_some() {
+                                        info!("[BOOK] {} {} | ask={:?}¢ bid={:?}¢ | fair={}¢ | edge={:+}¢ | {}",
+                                              asset, side,
+                                              ask_p, bid_p,
+                                              if is_yes { fair_yes } else { fair_no },
+                                              this_edge,
+                                              skip_reason.unwrap_or("tradeable"));
+                                    }
+
                                     // Trade YES if edge
                                     if yes_edge_actual >= edge {
-                                        let ask = yes_ask_price.unwrap();
-                                        let is_aggro = yes_edge_actual >= aggro_edge;
-
-                                        if dry_run {
-                                            if is_aggro {
-                                                info!("[DRY] Would IOC BUY ${:.0} YES @{}¢ | fair={}¢ edge={}¢ | {}",
-                                                      size, ask, fair_yes, yes_edge_actual, asset);
-                                            } else {
-                                                info!("[DRY] Would BUY ${:.0} YES @{}¢ | fair={}¢ edge={}¢ | {}",
-                                                      size, ask, fair_yes, yes_edge_actual, asset);
-                                            }
+                                        // Skip if this is an up/down market (no real edge calculation possible)
+                                        if skip_reason.is_some() {
+                                            info!("[SKIP] {} YES edge={}¢ but skipping: {}",
+                                                  asset, yes_edge_actual, skip_reason.unwrap());
                                         } else {
-                                            let price = ask as f64 / 100.0;
-                                            let contracts = size / price;
+                                            let ask = yes_ask_price.unwrap();
+                                            let is_aggro = yes_edge_actual >= aggro_edge;
 
-                                            warn!("[TRADE] 🎯 BUY ${:.0} YES @{}¢ | fair={}¢ edge={}¢ | {}",
-                                                  size, ask, fair_yes, yes_edge_actual, asset);
-
-                                            match shared_client.buy_fak(&yes_token, price, contracts).await {
-                                                Ok(fill) => {
-                                                    warn!("[TRADE] ✅ Filled {:.2} @${:.2} | order_id={}",
-                                                          fill.filled_size, fill.fill_cost, fill.order_id);
-                                                    // Update position
-                                                    let mut s = state.write().await;
-                                                    if let Some(pos) = s.positions.get_mut(&market_id) {
-                                                        pos.yes_qty += fill.filled_size;
-                                                        pos.yes_cost += fill.fill_cost;
-                                                    }
+                                            if dry_run {
+                                                if is_aggro {
+                                                    warn!("[DRY] 🎯 Would IOC BUY ${:.0} YES @{}¢ | fair={}¢ edge={}¢ | {}",
+                                                          size, ask, fair_yes, yes_edge_actual, asset);
+                                                } else {
+                                                    warn!("[DRY] 🎯 Would BUY ${:.0} YES @{}¢ | fair={}¢ edge={}¢ | {}",
+                                                          size, ask, fair_yes, yes_edge_actual, asset);
                                                 }
-                                                Err(e) => error!("[TRADE] ❌ YES buy failed: {}", e),
+                                            } else {
+                                                let price = ask as f64 / 100.0;
+                                                let contracts = size / price;
+
+                                                warn!("[TRADE] 🎯 BUY ${:.0} YES @{}¢ | fair={}¢ edge={}¢ | {}",
+                                                      size, ask, fair_yes, yes_edge_actual, asset);
+
+                                                match shared_client.buy_fak(&yes_token, price, contracts).await {
+                                                    Ok(fill) => {
+                                                        warn!("[TRADE] ✅ Filled {:.2} @${:.2} | order_id={}",
+                                                              fill.filled_size, fill.fill_cost, fill.order_id);
+                                                        // Update position
+                                                        let mut s = state.write().await;
+                                                        if let Some(pos) = s.positions.get_mut(&market_id) {
+                                                            pos.yes_qty += fill.filled_size;
+                                                            pos.yes_cost += fill.fill_cost;
+                                                        }
+                                                    }
+                                                    Err(e) => error!("[TRADE] ❌ YES buy failed: {}", e),
+                                                }
                                             }
                                         }
                                     }
 
                                     // Trade NO if edge
                                     if no_edge_actual >= edge {
-                                        let Some(ask) = no_ask_price else { continue };
-                                        let is_aggro = no_edge_actual >= aggro_edge;
-
-                                        if dry_run {
-                                            if is_aggro {
-                                                info!("[DRY] Would IOC BUY ${:.0} NO @{}¢ | fair={}¢ edge={}¢ | {}",
-                                                      size, ask, fair_no, no_edge_actual, asset);
-                                            } else {
-                                                info!("[DRY] Would BUY ${:.0} NO @{}¢ | fair={}¢ edge={}¢ | {}",
-                                                      size, ask, fair_no, no_edge_actual, asset);
-                                            }
+                                        // Skip if this is an up/down market (no real edge calculation possible)
+                                        if skip_reason.is_some() {
+                                            info!("[SKIP] {} NO edge={}¢ but skipping: {}",
+                                                  asset, no_edge_actual, skip_reason.unwrap());
                                         } else {
-                                            let price = ask as f64 / 100.0;
-                                            let contracts = size / price;
+                                            let Some(ask) = no_ask_price else { continue };
+                                            let is_aggro = no_edge_actual >= aggro_edge;
 
-                                            warn!("[TRADE] 🎯 BUY ${:.0} NO @{}¢ | fair={}¢ edge={}¢ | {}",
-                                                  size, ask, fair_no, no_edge_actual, asset);
-
-                                            match shared_client.buy_fak(&no_token, price, contracts).await {
-                                                Ok(fill) => {
-                                                    warn!("[TRADE] ✅ Filled {:.2} @${:.2} | order_id={}",
-                                                          fill.filled_size, fill.fill_cost, fill.order_id);
-                                                    // Update position
-                                                    let mut s = state.write().await;
-                                                    if let Some(pos) = s.positions.get_mut(&market_id) {
-                                                        pos.no_qty += fill.filled_size;
-                                                        pos.no_cost += fill.fill_cost;
-                                                    }
+                                            if dry_run {
+                                                if is_aggro {
+                                                    warn!("[DRY] 🎯 Would IOC BUY ${:.0} NO @{}¢ | fair={}¢ edge={}¢ | {}",
+                                                          size, ask, fair_no, no_edge_actual, asset);
+                                                } else {
+                                                    warn!("[DRY] 🎯 Would BUY ${:.0} NO @{}¢ | fair={}¢ edge={}¢ | {}",
+                                                          size, ask, fair_no, no_edge_actual, asset);
                                                 }
-                                                Err(e) => error!("[TRADE] ❌ NO buy failed: {}", e),
+                                            } else {
+                                                let price = ask as f64 / 100.0;
+                                                let contracts = size / price;
+
+                                                warn!("[TRADE] 🎯 BUY ${:.0} NO @{}¢ | fair={}¢ edge={}¢ | {}",
+                                                      size, ask, fair_no, no_edge_actual, asset);
+
+                                                match shared_client.buy_fak(&no_token, price, contracts).await {
+                                                    Ok(fill) => {
+                                                        warn!("[TRADE] ✅ Filled {:.2} @${:.2} | order_id={}",
+                                                              fill.filled_size, fill.fill_cost, fill.order_id);
+                                                        // Update position
+                                                        let mut s = state.write().await;
+                                                        if let Some(pos) = s.positions.get_mut(&market_id) {
+                                                            pos.no_qty += fill.filled_size;
+                                                            pos.no_cost += fill.fill_cost;
+                                                        }
+                                                    }
+                                                    Err(e) => error!("[TRADE] ❌ NO buy failed: {}", e),
+                                                }
                                             }
                                         }
                                     }

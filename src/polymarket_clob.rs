@@ -480,11 +480,15 @@ impl PolymarketAsyncClient {
         Ok(headers)
     }
 
-    /// Post order 
+    /// Post order
     pub async fn post_order_async(&self, body: String, creds: &PreparedCreds) -> Result<reqwest::Response> {
         let path = "/order";
         let url = format!("{}{}", self.host, path);
         let headers = self.build_l2_headers("POST", path, Some(&body), creds)?;
+
+        tracing::info!("[POLY-ORDER] URL: {}", url);
+        tracing::info!("[POLY-ORDER] Headers: {:?}", headers);
+        tracing::info!("[POLY-ORDER] Body: {}", body);
 
         let resp = self.http
             .post(&url)
