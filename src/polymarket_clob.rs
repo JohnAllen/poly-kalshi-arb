@@ -17,7 +17,7 @@ use serde_json::json;
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::sync::Arc;
-use log::log;
+use log::{info, log};
 
 const USER_AGENT: &str = "py_clob_client";
 const MSG_TO_SIGN: &str = "This message attests that I control the given wallet";
@@ -458,7 +458,9 @@ impl PolymarketAsyncClient {
 
     /// Derive API credentials from L1 wallet signature
     pub async fn derive_api_key(&self, nonce: u64) -> Result<ApiCreds> {
+        info!("[poly_momentum] Wallet: {}", self.wallet_address_str);
         let url = format!("{}/auth/derive-api-key", self.host);
+        info!("[poly_momentum] GET url: {}", url);
         let headers = self.build_l1_headers(nonce)?;
         log::info!("headers: {:?}", headers);
         let resp = self.http.get(&url).headers(headers).send().await?;
