@@ -125,6 +125,7 @@ dependencies = [
  "governor",
  "hex",
  "hmac",
+ "log",
  "nonzero_ext",
  "pkcs1",
  "rand 0.8.5",
