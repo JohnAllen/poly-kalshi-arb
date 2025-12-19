@@ -128,9 +128,7 @@ fn clob_auth_digest(chain_id: u64, address_str: &str, timestamp: u64, nonce: u64
         "domain": { "name": "ClobAuthDomain", "version": "1", "chainId": chain_id },
         "message": { "address": address_str, "timestamp": timestamp.to_string(), "nonce": nonce, "message": MSG_TO_SIGN }
     });
-    info!("[poly_clob_auth_digest] {}", typed_json);
     let typed: TypedData = serde_json::from_value(typed_json)?;
-    info!("[poly_clob_auth_digest] {:?}", typed);
     Ok(typed.encode_eip712()?.into())
 }
 
@@ -413,8 +411,8 @@ pub struct PolymarketAsyncClient {
 impl PolymarketAsyncClient {
     pub fn new(host: &str, chain_id: u64, private_key: &str, funder: &str) -> Result<Self> {
         let wallet = private_key.parse::<LocalWallet>()?.with_chain_id(chain_id);
-        // Use Display format for checksummed (EIP-55) address - required for EIP712
-        let wallet_address_str = format!("{}", wallet.address());
+        // Use Debug format for full checksummed address - ethers 2.0 Display truncates
+        let wallet_address_str = format!("{:?}", wallet.address());
         let address_header = HeaderValue::from_str(&wallet_address_str)
             .map_err(|e| anyhow!("Invalid wallet address for header: {}", e))?;
 
@@ -447,11 +445,8 @@ impl PolymarketAsyncClient {
     /// wallet.sign_hash() is CPU-bound (~1ms), safe to call in async context
     fn build_l1_headers(&self, nonce: u64) -> Result<HeaderMap> {
         let timestamp = current_unix_ts();
-        info!("[poly_momentum] Wallet: {} clob_auth_digest next", self.wallet_address_str);
         let digest = clob_auth_digest(self.chain_id, &self.wallet_address_str, timestamp, nonce)?;
-        info!("[poly_momentum] Digest: {} clob_auth_digest", digest);
         let sig = self.wallet.sign_hash(digest)?;
-        info!("[poly_momentum] Sig: {}", sig);
         let mut headers = HeaderMap::new();
         headers.insert("POLY_ADDRESS", self.address_header.clone());
         headers.insert("POLY_SIGNATURE", HeaderValue::from_str(&format!("0x{}", sig))?);
@@ -463,18 +458,11 @@ impl PolymarketAsyncClient {
 
     /// Derive API credentials from L1 wallet signature
     pub async fn derive_api_key(&self, nonce: u64) -> Result<ApiCreds> {
-        info!("[poly_momentum] Wallet: {}", self.wallet_address_str);
         let url = format!("{}/auth/derive-api-key", self.host);
-        info!("[poly_momentum] GET url: {}", url);
         let headers = self.build_l1_headers(nonce)?;
-        log::info!("headers: {:?}", headers);
         let resp = self.http.get(&url).headers(headers).send().await?;
-        if !resp.status().is_success() {
-            return Err(anyhow!("request failed with status code {}", resp.status()).into());
-        }
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        log::info!("[poly_momentum] body {}", body);
         if !status.is_success() {
             return Err(anyhow!("derive-api-key failed: {} {}", status, body));
         }
