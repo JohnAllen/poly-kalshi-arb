@@ -130,7 +130,7 @@ fn clob_auth_digest(chain_id: u64, address_str: &str, timestamp: u64, nonce: u64
     });
     info!("[poly_clob_auth_digest] {}", typed_json);
     let typed: TypedData = serde_json::from_value(typed_json)?;
-    info!("[poly_clob_auth_digest] {}", typed);
+    info!("[poly_clob_auth_digest] {:?}", typed);
     Ok(typed.encode_eip712()?.into())
 }
 
