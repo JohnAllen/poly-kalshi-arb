@@ -271,11 +271,17 @@ pub fn get_order_amounts_buy(size_micro: u64, price_bps: u64) -> (i32, u128, u12
 /// For SELL with side="SELL" string: API calculates price = taker/maker
 /// maker = tokens (what we give), taker = USDC (what we receive)
 /// price = taker/maker = USDC/tokens < 1 ✓
+///
+/// IMPORTANT: Polymarket requires specific precision for sell orders:
+/// - maker (tokens) = max 2 decimal places (must be divisible by 10000)
+/// - taker (USDC) = max 4 decimal places (must be divisible by 100)
 #[inline(always)]
 pub fn get_order_amounts_sell(size_micro: u64, price_bps: u64) -> (i32, u128, u128) {
-    // Semantic order: maker=tokens, taker=USDC
-    let maker = size_micro as u128;
-    let taker = (size_micro as u128 * price_bps as u128) / 10000;
+    // Round maker (tokens) down to 2 decimal places (divisible by 10000)
+    let maker = (size_micro as u128 / 10000) * 10000;
+    // Calculate taker and round down to 4 decimal places (divisible by 100)
+    let taker_raw = (maker * price_bps as u128) / 10000;
+    let taker = (taker_raw / 100) * 100;
     (1, maker, taker)
 }
 
