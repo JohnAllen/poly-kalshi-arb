@@ -641,9 +641,9 @@ impl SharedAsyncClient {
         // Owner must be the API key (not wallet address or funder!)
         let body = signed.post_body(&self.creds.api_key, order_type.as_str());
 
-        tracing::debug!("[POLY] Order: maker={} taker={} side={} price={:.2} neg_risk={}",
+        tracing::info!("[POLY] Order: maker={} taker={} side={} price={:.2} neg_risk={}",
             signed.order.maker_amount, signed.order.taker_amount, signed.order.side, price, neg_risk);
-        tracing::debug!("[POLY] Full body: {}", body);
+        tracing::info!("[POLY] Full body: {}", body);
 
         // Post order
         let resp = self.inner.post_order_async(body, &self.creds).await?;
