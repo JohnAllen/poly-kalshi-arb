@@ -59,6 +59,14 @@ struct Args {
     /// Connect directly to Polygon.io instead of local price server
     #[arg(short, long, default_value_t = false)]
     direct: bool,
+
+    /// Max total contracts to hold (default: 10)
+    #[arg(short, long, default_value_t = 10.0)]
+    max_contracts: f64,
+
+    /// Take profit threshold in cents (sell when bid >= entry + this)
+    #[arg(long, default_value_t = 5)]
+    take_profit: i64,
 }
 
 const POLYMARKET_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
@@ -208,6 +216,25 @@ impl State {
             open_positions: Vec::new(),
         }
     }
+
+    fn total_position_size(&self) -> f64 {
+        self.open_positions.iter().map(|p| p.size).sum()
+    }
+
+    fn add_position(&mut self, asset: String, token_id: String, side: &'static str, entry_price: i64, size: f64) {
+        self.open_positions.push(OpenPosition {
+            asset,
+            token_id,
+            side,
+            entry_price,
+            size,
+            opened_at: Instant::now(),
+        });
+    }
+
+    fn remove_position(&mut self, token_id: &str) {
+        self.open_positions.retain(|p| p.token_id != token_id);
+    }
 }
 
 
@@ -255,7 +282,7 @@ async fn run_price_feed(
     trade_symbol: Option<String>,
 ) {
     loop {
-        info!("[poly_momentum] Connecting to local price server...");
+        tracing::debug!("[poly_momentum] Connecting to local price server...");
 
         let ws = match connect_async(LOCAL_PRICE_SERVER).await {
             Ok((ws, _)) => ws,
@@ -267,7 +294,7 @@ async fn run_price_feed(
         };
 
         let (mut write, mut read) = ws.split();
-        info!("[poly_momentum] Connected to local price server");
+        tracing::debug!("[poly_momentum] Connected to local price server");
 
         let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
 
@@ -385,7 +412,7 @@ async fn run_price_feed(
             }
         }
 
-        warn!("[poly_momentum] Disconnected, reconnecting in 2s...");
+        tracing::debug!("[poly_momentum] Disconnected, reconnecting...");
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
@@ -398,7 +425,7 @@ async fn run_direct_price_feed(
     trade_symbol: Option<String>,
 ) {
     loop {
-        info!("[poly_momentum] Connecting directly to Polygon.io...");
+        tracing::debug!("[poly_momentum] Connecting to Polygon.io...");
 
         let ws = match connect_async(PRICEFEED_WS_URL).await {
             Ok((ws, _)) => ws,
@@ -410,7 +437,7 @@ async fn run_direct_price_feed(
         };
 
         let (mut write, mut read) = ws.split();
-        info!("[poly_momentum] Connected to Polygon.io, authenticating...");
+        tracing::debug!("[poly_momentum] Authenticating with Polygon.io...");
 
         // Authenticate
         let auth = PolygonAuth {
@@ -430,7 +457,7 @@ async fn run_direct_price_feed(
                 if let Ok(statuses) = serde_json::from_str::<Vec<PolygonStatus>>(&text) {
                     if let Some(s) = statuses.first() {
                         if s.status.as_deref() == Some("auth_success") {
-                            info!("[poly_momentum] Polygon.io authenticated");
+                            tracing::debug!("[poly_momentum] Polygon.io authenticated");
                             authenticated = true;
                             break;
                         } else if s.status.as_deref() == Some("auth_failed") {
@@ -457,7 +484,7 @@ async fn run_direct_price_feed(
             tokio::time::sleep(Duration::from_secs(5)).await;
             continue;
         }
-        info!("[poly_momentum] Subscribed to BTC, ETH, SOL, XRP trades");
+        tracing::debug!("[poly_momentum] Subscribed to trades");
 
         let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
 
@@ -571,7 +598,7 @@ async fn run_direct_price_feed(
             }
         }
 
-        warn!("[poly_momentum] Disconnected from Polygon.io, reconnecting in 2s...");
+        tracing::debug!("[poly_momentum] Polygon.io disconnected, reconnecting...");
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
@@ -589,6 +616,18 @@ struct BookSnapshot {
 struct PriceLevel {
     price: String,
     size: String,
+}
+
+// Incremental price updates from Polymarket
+#[derive(Deserialize, Debug)]
+struct PriceChangeMsg {
+    price_changes: Vec<PriceChange>,
+}
+
+#[derive(Deserialize, Debug)]
+struct PriceChange {
+    asset_id: String,
+    price: String,
 }
 
 #[derive(Serialize)]
@@ -622,24 +661,10 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    info!("[poly_momentum] ═══════════════════════════════════════════════════════════════");
-    info!("[poly_momentum] 🚀 POLYMARKET MOMENTUM FRONT-RUNNER");
-    info!("[poly_momentum] ═══════════════════════════════════════════════════════════════");
-    info!("[poly_momentum] STRATEGY:");
-    info!("[poly_momentum]    1. Detect instant price moves (>{}bps per tick)", args.threshold_bps);
-    info!("[poly_momentum]    2. Buy YES on up moves, NO on down moves");
-    info!("[poly_momentum]    3. Front-run slow market makers");
-    info!("[poly_momentum] ═══════════════════════════════════════════════════════════════");
-    info!("[poly_momentum] CONFIG:");
-    info!("[poly_momentum]    Mode: {}", if args.live { "🔴 LIVE" } else { "🔍 DRY RUN" });
-    info!("[poly_momentum]    Price Feed: {}", if args.direct { "Direct Polygon.io" } else { "Local server (ws://127.0.0.1:9999)" });
-    info!("[poly_momentum]    Contracts: {:.1} per trade", args.contracts);
-    info!("[poly_momentum]    Threshold: {}bps per tick ({}%)", args.threshold_bps, args.threshold_bps as f64 / 100.0);
-    info!("[poly_momentum]    Min Edge: {}¢", args.edge);
-    if let Some(ref sym) = args.sym {
-        info!("[poly_momentum]    Symbol: {}", sym);
-    }
-    info!("[poly_momentum] ═══════════════════════════════════════════════════════════════");
+    let mode = if args.live { "LIVE" } else { "DRY" };
+    let sym_str = args.sym.as_deref().unwrap_or("ALL");
+    info!("[poly_momentum] {} | {} | {}bps | {}¢ edge | max {} | TP {}¢",
+          mode, sym_str, args.threshold_bps, args.edge, args.max_contracts, args.take_profit);
 
     // Load credentials from project root .env
     let project_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -673,8 +698,7 @@ async fn main() -> Result<()> {
         );
     }
 
-    info!("[poly_momentum] Credentials: pk_len={}, funder_len={}", pk_len, funder_len);
-    info!("[poly_momentum] Funder: {}", funder);
+    tracing::debug!("[poly_momentum] Credentials loaded, funder={}", funder);
 
     // Initialize Polymarket client
     let poly_client = PolymarketAsyncClient::new(
@@ -684,13 +708,12 @@ async fn main() -> Result<()> {
         &funder,
     ).context("Failed to create Polymarket client")?;
 
-    info!("[poly_momentum] Wallet: {}", poly_client.wallet_address());
-    info!("[poly_momentum] Deriving API credentials...");
+    tracing::debug!("[poly_momentum] Wallet: {}", poly_client.wallet_address());
     let api_creds = poly_client.derive_api_key(0).await
         .context("derive_api_key failed - check wallet/funder addresses")?;
     let prepared_creds = PreparedCreds::from_api_creds(&api_creds)?;
     let shared_client = Arc::new(SharedAsyncClient::new(poly_client, prepared_creds, 137));
-    info!("[poly_momentum] API credentials ready");
+    tracing::debug!("[poly_momentum] API credentials ready");
 
     if args.live {
         warn!("⚠️  LIVE MODE - Real money at risk! ({} contracts)", args.contracts);
@@ -698,15 +721,9 @@ async fn main() -> Result<()> {
     }
 
     // Discover markets
-    info!("[poly_momentum] Searching for markets...");
     let discovered = discover_markets(args.sym.as_deref()).await?;
-    info!("[poly_momentum] Found {} markets", discovered.len());
-
     for m in &discovered {
-        info!("  • {} | {} | Expiry: {:.1?}min",
-              m.asset,
-              &m.question[..m.question.len().min(50)],
-              m.expiry_minutes);
+        info!("[poly_momentum] {} | {:.0}min left", m.asset, m.expiry_minutes.unwrap_or(0.0));
     }
 
     if discovered.is_empty() {
@@ -758,10 +775,12 @@ async fn main() -> Result<()> {
     let contracts = args.contracts;
     let dry_run = !args.live;
     let status_symbol = args.sym;
+    let max_contracts = args.max_contracts;
+    let take_profit = args.take_profit;
 
     // Main WebSocket loop
     loop {
-        info!("[poly_momentum] Connecting to Polymarket...");
+        tracing::debug!("[poly_momentum] Connecting to Polymarket...");
 
         let (ws, _) = match connect_async(POLYMARKET_WS_URL).await {
             Ok(ws) => ws,
@@ -780,7 +799,7 @@ async fn main() -> Result<()> {
             sub_type: "market",
         };
         let _ = write.send(Message::Text(serde_json::to_string(&sub)?)).await;
-        info!("[poly_momentum] Subscribed to {} tokens", tokens.len());
+        tracing::debug!("[poly_momentum] Subscribed to {} tokens", tokens.len());
 
         let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
         let mut signal_check = tokio::time::interval(Duration::from_millis(100));
@@ -833,9 +852,29 @@ async fn main() -> Result<()> {
                     }
 
                     if !status_parts.is_empty() {
-                        info!("[status] {}", status_parts.join(" | "));
-                    } else {
-                        info!("[status] Waiting for data...");
+                        tracing::debug!("[status] {}", status_parts.join(" | "));
+                    }
+
+                    // Print positions if any
+                    if !s.open_positions.is_empty() {
+                        for pos in &s.open_positions {
+                            // Find current bid for this position
+                            let market = s.markets.values().find(|m|
+                                m.yes_token == pos.token_id || m.no_token == pos.token_id
+                            );
+                            let current_bid = market.and_then(|m| {
+                                if pos.side == "YES" { m.yes_bid } else { m.no_bid }
+                            });
+                            let pnl = current_bid.map(|bid| {
+                                let cost = pos.size * pos.entry_price as f64 / 100.0;
+                                let value = pos.size * bid as f64 / 100.0;
+                                value - cost
+                            });
+                            let pnl_str = pnl.map(|p| format!("{:+.2}", p)).unwrap_or_else(|| "?".to_string());
+                            let bid_str = current_bid.map(|b| format!("{}¢", b)).unwrap_or_else(|| "?".to_string());
+                            info!("[pos] {:.1} {} {} @{}¢ | bid={} | P&L ${}",
+                                  pos.size, pos.asset, pos.side, pos.entry_price, bid_str, pnl_str);
+                        }
                     }
                 }
 
@@ -843,19 +882,80 @@ async fn main() -> Result<()> {
                     // Process pending momentum signals
                     let mut s = state.write().await;
 
+                    // Check for profit-taking opportunities
+                    if !dry_run {
+                        // (token_id, asset, bid, size, entry_price)
+                        let positions_to_close: Vec<(String, String, i64, f64, i64)> = s.open_positions.iter()
+                            .filter_map(|pos| {
+                                // Find the market for this position
+                                let market = s.markets.values().find(|m|
+                                    m.yes_token == pos.token_id || m.no_token == pos.token_id
+                                )?;
+
+                                // Get current bid for our position
+                                let current_bid = if pos.side == "YES" { market.yes_bid? } else { market.no_bid? };
+
+                                // Check if we can take profit
+                                let profit = current_bid - pos.entry_price;
+                                if profit >= take_profit {
+                                    Some((pos.token_id.clone(), pos.asset.clone(), current_bid, pos.size, pos.entry_price))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+
+                        for (token_id, asset, bid, size, entry) in positions_to_close {
+                            let client = shared_client.clone();
+                            let state_clone = state.clone();
+                            let token_clone = token_id.clone();
+
+                            let cost = size * entry as f64 / 100.0;
+                            let revenue = size * bid as f64 / 100.0;
+                            let profit = revenue - cost;
+                            warn!("[poly_momentum] 💰 SELL {:.1} {} @{}¢ (cost=${:.2} rev=${:.2} +${:.2})",
+                                  size, asset, bid, cost, revenue, profit);
+
+                            tokio::spawn(async move {
+                                // Sell 1¢ below bid to ensure fill
+                                let sell_price = (bid - 1).max(1) as f64 / 100.0;
+                                match client.sell_fak(&token_clone, sell_price, size).await {
+                                    Ok(fill) if fill.filled_size > 0.0 => {
+                                        warn!("[poly_momentum] ✅ Sold {:.1} @${:.2}", fill.filled_size, fill.fill_cost);
+                                        let mut s = state_clone.write().await;
+                                        s.remove_position(&token_clone);
+                                    }
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        error!("[poly_momentum] ❌ Sell error: {}", e);
+                                    }
+                                }
+                            });
+                        }
+                    }
+
                     // Remove stale signals (>5s old)
                     s.pending_signals.retain(|sig| sig.triggered_at.elapsed() < Duration::from_secs(5));
 
                     // Process signals
                     let signals: Vec<MomentumSignal> = s.pending_signals.drain(..).collect();
 
+                    // Get position size before signal loop (to avoid borrow conflicts)
+                    let current_position = s.total_position_size();
+
                     for signal in signals {
+                        // Check max contracts limit first
+                        if current_position >= max_contracts {
+                            tracing::debug!("[poly_momentum] Max position reached ({:.0}/{:.0})", current_position, max_contracts);
+                            continue;
+                        }
+
                         // Get current price first (before mutable borrow)
                         let current_price = s.price_trackers.get(&signal.asset)
                             .and_then(|t| t.last_price);
 
                         let Some(current_price) = current_price else {
-                            warn!("[poly_momentum] {} - no current price", signal.asset);
+                            tracing::debug!("[poly_momentum] {} - no current price", signal.asset);
                             continue;
                         };
 
@@ -880,7 +980,7 @@ async fn main() -> Result<()> {
                         };
 
                         let Some(ask) = ask_price else {
-                            warn!("[poly_momentum] {} {} - no ask price", signal.asset, buy_side);
+                            tracing::debug!("[poly_momentum] {} {} - no ask price", signal.asset, buy_side);
                             continue;
                         };
 
@@ -896,51 +996,64 @@ async fn main() -> Result<()> {
                             }
                         };
 
-                        // Show strike in log if available
-                        let strike_info = market.strike_price
-                            .map(|s| format!(" strike=${:.0}", s))
-                            .unwrap_or_default();
-
                         if edge < edge_threshold {
-                            info!("[poly_momentum] {} {} - edge {}¢ < {}¢ threshold (ask={}¢, fair={}¢{})",
-                                  signal.asset, buy_side, edge, edge_threshold, ask, fair_for_side, strike_info);
+                            tracing::debug!("[poly_momentum] {} {} - edge {}¢ < {}¢ (ask={}¢ fair={}¢)",
+                                  signal.asset, buy_side, edge, edge_threshold, ask, fair_for_side);
                             continue;
                         }
 
+                        // Calculate remaining capacity
+                        let remaining = max_contracts - current_position;
+
                         let market_id_clone = market_id.clone();
                         let buy_token_clone = buy_token.clone();
+                        let asset_clone = signal.asset.clone();
+                        let entry_price = ask + 2; // crossing price in cents
 
-                        let price = ask as f64 / 100.0;
+                        // Add 2¢ to cross the spread and ensure FAK fills
+                        let cross_price = entry_price.min(99) as f64 / 100.0;
                         // Polymarket requires minimum $1 order value - scale up contracts if needed
-                        let min_contracts = (1.0 / price).ceil();
-                        let actual_contracts = contracts.max(min_contracts);
-                        let cost = actual_contracts * price;
+                        let min_contracts = (1.0 / cross_price).ceil();
+                        // Don't exceed remaining capacity
+                        let actual_contracts = contracts.max(min_contracts).min(remaining);
+                        let cost = actual_contracts * cross_price;
+
+                        // Skip if below $1 minimum or less than 1 contract
+                        if cost < 1.0 || actual_contracts < 1.0 {
+                            tracing::debug!("[poly_momentum] Skip: cost ${:.2} < $1 min (remaining={:.1})", cost, remaining);
+                            continue;
+                        }
 
                         if dry_run {
-                            warn!("[poly_momentum] 🎯 Would BUY {:.0} {} {} @{}¢ (${:.2}) | move={}bps | edge={}¢",
-                                  actual_contracts, signal.asset, buy_side, ask, cost, signal.move_bps.abs(), edge);
+                            warn!("[poly_momentum] 🎯 Would BUY {:.0} {} {} @{}¢ (${:.2}) | edge={}¢",
+                                  actual_contracts, signal.asset, buy_side, entry_price, cost, edge);
                             market.last_trade_time = Some(Instant::now());
                         } else {
-                            warn!("[poly_momentum] 🎯 BUY {:.0} {} {} @{}¢ (${:.2}) | move={}bps | edge={}¢",
-                                  actual_contracts, signal.asset, buy_side, ask, cost, signal.move_bps.abs(), edge);
+                            warn!("[poly_momentum] 🎯 BUY {:.0} {} {} @{}¢ (${:.2}) | edge={}¢",
+                                  actual_contracts, signal.asset, buy_side, entry_price, cost, edge);
 
                             let client = shared_client.clone();
                             let state_clone = state.clone();
 
                             // Execute trade asynchronously
                             tokio::spawn(async move {
-                                match client.buy_fak(&buy_token_clone, price, actual_contracts).await {
-                                    Ok(fill) => {
-                                        warn!("[poly_momentum] ✅ Filled {:.2} @${:.2} | order_id={}",
-                                              fill.filled_size, fill.fill_cost, fill.order_id);
+                                match client.buy_fak(&buy_token_clone, cross_price, actual_contracts).await {
+                                    Ok(fill) if fill.filled_size > 0.0 => {
+                                        warn!("[poly_momentum] ✅ Filled {:.1} @${:.2}",
+                                              fill.filled_size, fill.fill_cost);
 
                                         let mut s = state_clone.write().await;
                                         if let Some(m) = s.markets.get_mut(&market_id_clone) {
                                             m.last_trade_time = Some(Instant::now());
                                         }
+                                        // Track position
+                                        s.add_position(asset_clone, buy_token_clone, buy_side, entry_price, fill.filled_size);
+                                    }
+                                    Ok(_) => {
+                                        // No fill - FAK killed, already logged in clob
                                     }
                                     Err(e) => {
-                                        error!("[poly_momentum] ❌ Buy failed: {}", e);
+                                        error!("[poly_momentum] ❌ Order error: {}", e);
                                     }
                                 }
                             });
@@ -957,6 +1070,8 @@ async fn main() -> Result<()> {
                         Ok(Message::Text(text)) => {
                             // Update orderbook
                             tracing::trace!("[ws] Received: {}", &text[..text.len().min(200)]);
+
+                            // Try parsing as full orderbook snapshot
                             if let Ok(books) = serde_json::from_str::<Vec<BookSnapshot>>(&text) {
                                 let mut s = state.write().await;
 
@@ -983,10 +1098,6 @@ async fn main() -> Result<()> {
 
                                     let is_yes = book.asset_id == market.yes_token;
 
-                                    let side = if is_yes { "YES" } else { "NO" };
-                                    let old_ask = if is_yes { market.yes_ask } else { market.no_ask };
-                                    let old_bid = if is_yes { market.yes_bid } else { market.no_bid };
-
                                     if is_yes {
                                         market.yes_ask = best_ask;
                                         market.yes_bid = best_bid;
@@ -994,11 +1105,36 @@ async fn main() -> Result<()> {
                                         market.no_ask = best_ask;
                                         market.no_bid = best_bid;
                                     }
+                                }
+                            }
+                            // Try parsing as incremental price change
+                            else if let Ok(msg) = serde_json::from_str::<PriceChangeMsg>(&text) {
+                                let mut s = state.write().await;
 
-                                    // Log orderbook updates when prices change
-                                    if best_ask != old_ask || best_bid != old_bid {
-                                        tracing::debug!("[book] {} {} bid={:?}¢ ask={:?}¢",
-                                            market.asset, side, best_bid, best_ask);
+                                for change in msg.price_changes {
+                                    let market = s.markets.values_mut()
+                                        .find(|m| m.yes_token == change.asset_id || m.no_token == change.asset_id);
+
+                                    let Some(market) = market else { continue };
+                                    let price = parse_price_cents(&change.price);
+                                    if price <= 0 { continue; }
+
+                                    let is_yes = change.asset_id == market.yes_token;
+                                    let side = if is_yes { "YES" } else { "NO" };
+
+                                    // Use price as approximate mid - bid slightly below, ask slightly above
+                                    let bid = (price - 1).max(1);
+                                    let ask = (price + 1).min(99);
+
+                                    tracing::debug!("[book] {} {} price={}¢ -> bid={}¢ ask={}¢",
+                                        market.asset, side, price, bid, ask);
+
+                                    if is_yes {
+                                        market.yes_bid = Some(bid);
+                                        market.yes_ask = Some(ask);
+                                    } else {
+                                        market.no_bid = Some(bid);
+                                        market.no_ask = Some(ask);
                                     }
                                 }
                             }
@@ -1013,7 +1149,7 @@ async fn main() -> Result<()> {
             }
         }
 
-        info!("[poly_momentum] Disconnected, reconnecting in 3s...");
+        tracing::debug!("[poly_momentum] Polymarket disconnected, reconnecting...");
         tokio::time::sleep(Duration::from_secs(3)).await;
     }
 }

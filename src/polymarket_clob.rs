@@ -3,7 +3,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, Context};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE;
 use ethers::signers::{LocalWallet, Signer};
@@ -190,7 +190,19 @@ pub struct SignedOrder {
 }
 
 impl SignedOrder {
+    /// Generate POST body for order submission
     pub fn post_body(&self, owner: &str, order_type: &str) -> String {
+        // Compute the price from amounts for the API
+        // For SELL (side=1), price = taker/maker to get value < 1
+        // For BUY (side=0), price = maker/taker
+        let maker_amt: f64 = self.order.maker_amount.parse().unwrap_or(0.0);
+        let taker_amt: f64 = self.order.taker_amount.parse().unwrap_or(1.0);
+        let api_price = if self.order.side == 1 {
+            taker_amt / maker_amt
+        } else {
+            maker_amt / taker_amt
+        };
+
         let mut buf = String::with_capacity(512);
         buf.push_str(r#"{"order":{"salt":"#);
         buf.push_str(&self.order.salt.to_string());
@@ -222,7 +234,9 @@ impl SignedOrder {
         buf.push_str(owner);
         buf.push_str(r#"","orderType":""#);
         buf.push_str(order_type);
-        buf.push_str(r#""}"#);
+        buf.push_str(r#"","price":""#);
+        buf.push_str(&format!("{:.2}", api_price));
+        buf.push_str(r#"","tickSize":"0.01"}"#);
         buf
     }
 }
@@ -257,7 +271,6 @@ pub fn size_to_micro(size: f64) -> u64 {
 pub fn get_order_amounts_buy(size_micro: u64, price_bps: u64) -> (i32, u128, u128) {
     // For BUY: taker = size (what we receive), maker = size * price (what we pay)
     let taker = size_micro as u128;
-    // maker = size * price / 10000 (convert bps to ratio)
     let maker = (size_micro as u128 * price_bps as u128) / 10000;
     (0, maker, taker)
 }
@@ -267,9 +280,8 @@ pub fn get_order_amounts_buy(size_micro: u64, price_bps: u64) -> (i32, u128, u12
 /// Output: (side=1, maker_amount, taker_amount) in token decimals (6 dp)
 #[inline(always)]
 pub fn get_order_amounts_sell(size_micro: u64, price_bps: u64) -> (i32, u128, u128) {
-    // For SELL: maker = size (what we give), taker = size * price (what we receive)
+    // For SELL: maker = tokens (what we give), taker = USDC (what we receive)
     let maker = size_micro as u128;
-    // taker = size * price / 10000 (convert bps to ratio)
     let taker = (size_micro as u128 * price_bps as u128) / 10000;
     (1, maker, taker)
 }
@@ -508,6 +520,7 @@ impl PolymarketAsyncClient {
     pub async fn get_order_async(&self, order_id: &str, creds: &PreparedCreds) -> Result<PolymarketOrderResponse> {
         let path = format!("/data/order/{}", order_id);
         let url = format!("{}{}", self.host, path);
+        info!("[get_order_async] Fetching order: {}", order_id);
         let headers = self.build_l2_headers("GET", &path, None, creds)?;
 
         let resp = self.http
@@ -522,7 +535,12 @@ impl PolymarketAsyncClient {
             return Err(anyhow!("get_order failed {}: {}", status, body));
         }
 
-        Ok(resp.json().await?)
+        let resp_text = resp.text().await?;
+        info!("[get_order_async] Raw response: {}", resp_text);
+
+        let parsed: PolymarketOrderResponse = serde_json::from_str(&resp_text)
+            .context(format!("Failed to parse order response: {}", resp_text))?;
+        Ok(parsed)
     }
 
     /// Check neg_risk for token - with caching
@@ -583,30 +601,38 @@ impl SharedAsyncClient {
         Ok(count)
     }
 
-    /// Execute FAK buy order - 
+    /// Execute FAK buy order
     pub async fn buy_fak(&self, token_id: &str, price: f64, size: f64) -> Result<PolyFillAsync> {
-        debug_assert!(!token_id.is_empty(), "token_id must not be empty");
-        debug_assert!(price > 0.0 && price < 1.0, "price must be 0 < p < 1");
-        debug_assert!(size >= 1.0, "size must be >= 1");
+        if size < 1.0 {
+            return Err(anyhow!("size must be >= 1, got {}", size));
+        }
         self.execute_order(token_id, price, size, "BUY").await
     }
 
-    /// Execute FAK sell order - 
+    /// Execute FAK sell order
     pub async fn sell_fak(&self, token_id: &str, price: f64, size: f64) -> Result<PolyFillAsync> {
-        debug_assert!(!token_id.is_empty(), "token_id must not be empty");
-        debug_assert!(price > 0.0 && price < 1.0, "price must be 0 < p < 1");
-        debug_assert!(size >= 1.0, "size must be >= 1");
-        self.execute_order(token_id, price, size, "SELL").await
+        if size < 1.0 {
+            return Err(anyhow!("size must be >= 1, got {}", size));
+        }
+        if price <= 0.0 || price >= 1.0 {
+            return Err(anyhow!("price must be 0 < p < 1, got {}", price));
+        }
+        info!("[POLY] SELL {:.1} @ {:.2}", size, price);
+        self.execute_order_with_type(token_id, price, size, "SELL", PolyOrderType::GTC).await
     }
 
     async fn execute_order(&self, token_id: &str, price: f64, size: f64, side: &str) -> Result<PolyFillAsync> {
+        self.execute_order_with_type(token_id, price, size, side, PolyOrderType::FAK).await
+    }
+
+    async fn execute_order_with_type(&self, token_id: &str, price: f64, size: f64, side: &str, order_type: PolyOrderType) -> Result<PolyFillAsync> {
         // Check neg_risk cache first
         let neg_risk = {
             let cache = self.neg_risk_cache.read().unwrap();
             cache.get(token_id).copied()
         };
 
-        let neg_risk = match neg_risk {
+        let mut neg_risk = match neg_risk {
             Some(nr) => nr,
             None => {
                 let nr = self.inner.check_neg_risk(token_id).await?;
@@ -619,31 +645,66 @@ impl SharedAsyncClient {
         // Build signed order
         let signed = self.build_signed_order(token_id, price, size, side, neg_risk)?;
         // Owner must be the API key (not wallet address or funder!)
-        let body = signed.post_body(&self.creds.api_key, PolyOrderType::FAK.as_str());
+        let body = signed.post_body(&self.creds.api_key, order_type.as_str());
+
+        tracing::debug!("[POLY] Order: maker={} taker={} side={} price={:.2} neg_risk={}",
+            signed.order.maker_amount, signed.order.taker_amount, signed.order.side, price, neg_risk);
+        tracing::debug!("[POLY] Full body: {}", body);
 
         // Post order
         let resp = self.inner.post_order_async(body, &self.creds).await?;
 
         if !resp.status().is_success() {
-            log::error!("request order failed: {}", resp.status());
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
+            // FAK orders with no liquidity return 400 - this is expected, not an error
+            if body.contains("no orders found to match") {
+                info!("[POLY] No liquidity at price - FAK killed");
+                return Ok(PolyFillAsync {
+                    order_id: String::new(),
+                    filled_size: 0.0,
+                    fill_cost: 0.0,
+                });
+            }
             return Err(anyhow!("Polymarket order failed {}: {}", status, body));
         }
 
-        info!("resp {:?}", resp);
-        let resp_json: serde_json::Value = resp.json().await?;
-        let order_id = resp_json["orderID"].as_str().unwrap_or("unknown").to_string();
+        let resp_text = resp.text().await?;
+        let resp_json: serde_json::Value = serde_json::from_str(&resp_text)
+            .context("Failed to parse order response as JSON")?;
 
-        // Query fill status
+        let order_id = resp_json["orderID"].as_str().unwrap_or("unknown").to_string();
+        let status = resp_json["status"].as_str().unwrap_or("unknown").to_string();
+        let success = resp_json["success"].as_bool().unwrap_or(false);
+        let taking_amount = resp_json["takingAmount"].as_str().unwrap_or("0");
+        let making_amount = resp_json["makingAmount"].as_str().unwrap_or("0");
+
+        tracing::debug!("[POLY] {} {} @ {:.2} -> status={}", side, size, price, status);
+
+        // If order was matched immediately, use response data directly
+        if status == "matched" && success {
+            let filled_size: f64 = taking_amount.parse().unwrap_or(0.0);
+            let cost: f64 = making_amount.parse().unwrap_or(0.0);
+            let price_per_share_cents = if filled_size > 0.0 { (cost / filled_size * 100.0).round() as i64 } else { 0 };
+            info!("[POLY] ✅ {} {:.1} @{}¢ (total ${:.2})", side, filled_size, price_per_share_cents, cost);
+            return Ok(PolyFillAsync {
+                order_id,
+                filled_size,
+                fill_cost: cost,
+            });
+        }
+
+        // Otherwise query fill status (for partial fills or pending orders)
         let order_info = self.inner.get_order_async(&order_id, &self.creds).await?;
         let filled_size: f64 = order_info.size_matched.parse().unwrap_or(0.0);
         let order_price: f64 = order_info.price.parse().unwrap_or(price);
 
-        tracing::debug!(
-            "[POLY-ASYNC] FAK {} {}: status={}, filled={:.2}/{:.2}, price={:.4}",
-            side, order_id, order_info.status, filled_size, size, order_price
-        );
+        if filled_size > 0.0 {
+            let price_per_share_cents = (order_price * 100.0).round() as i64;
+            info!("[POLY] ✅ {} {:.1} @{}¢ (total ${:.2})", side, filled_size, price_per_share_cents, filled_size * order_price);
+        } else {
+            tracing::debug!("[POLY] No fill (status={})", order_info.status);
+        }
 
         Ok(PolyFillAsync {
             order_id,

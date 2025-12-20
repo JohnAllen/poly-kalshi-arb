@@ -18,7 +18,7 @@
 //!   POLYGON_API_KEY - Polygon.io API key for price feed
 
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{TimeZone, Utc};
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -32,6 +32,7 @@ use tracing::{debug, error, info, warn};
 use arb_bot::polymarket_clob::{
     PolymarketAsyncClient, SharedAsyncClient, PreparedCreds,
 };
+use arb_bot::polymarket_markets::{discover_all_markets, PolyMarket};
 
 /// Polymarket ATM Sniper - Delta 0.50 Strategy
 #[derive(Parser, Debug)]
@@ -62,6 +63,14 @@ struct Args {
     #[arg(long)]
     market: Option<String>,
 
+    /// Asset symbol filter: btc, eth, sol, xrp (optional, monitors all if not set)
+    #[arg(long)]
+    sym: Option<String>,
+
+    /// Maximum total contracts to hold across all positions
+    #[arg(long, default_value_t = 10.0)]
+    max_contracts: f64,
+
     /// Minimum minutes remaining to trade (default: 2)
     #[arg(long, default_value_t = 2)]
     min_minutes: i64,
@@ -76,7 +85,6 @@ struct Args {
 }
 
 const POLYMARKET_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
-const GAMMA_API_BASE: &str = "https://gamma-api.polymarket.com";
 const POLYGON_WS_URL: &str = "wss://socket.polygon.io/crypto";
 const LOCAL_PRICE_SERVER: &str = "ws://127.0.0.1:9999";
 
@@ -87,9 +95,13 @@ struct Market {
     question: String,
     yes_token: String,
     no_token: String,
-    strike: Option<f64>,
-    asset: String, // "BTC" or "ETH"
+    asset: String, // "BTC", "ETH", "SOL", "XRP"
     expiry_minutes: Option<f64>,
+    discovered_at: std::time::Instant,
+    /// Unix timestamp when the 15-minute window starts (from slug)
+    window_start_ts: Option<i64>,
+    /// Strike price - captured from price feed when window starts
+    strike_price: Option<f64>,
     // Orderbook
     yes_ask: Option<i64>,
     yes_bid: Option<i64>,
@@ -97,6 +109,35 @@ struct Market {
     no_bid: Option<i64>,
     yes_ask_size: f64,
     no_ask_size: f64,
+}
+
+impl Market {
+    fn from_polymarket(pm: PolyMarket) -> Self {
+        Self {
+            condition_id: pm.condition_id,
+            question: pm.question,
+            yes_token: pm.yes_token,
+            no_token: pm.no_token,
+            asset: pm.asset,
+            expiry_minutes: pm.expiry_minutes,
+            discovered_at: std::time::Instant::now(),
+            window_start_ts: pm.window_start_ts,
+            strike_price: None, // Will be captured from price feed
+            yes_ask: None,
+            yes_bid: None,
+            no_ask: None,
+            no_bid: None,
+            yes_ask_size: 0.0,
+            no_ask_size: 0.0,
+        }
+    }
+
+    fn time_remaining_mins(&self) -> Option<f64> {
+        self.expiry_minutes.map(|exp| {
+            let elapsed_mins = self.discovered_at.elapsed().as_secs_f64() / 60.0;
+            (exp - elapsed_mins).max(0.0)
+        })
+    }
 }
 
 /// Position tracking
@@ -134,6 +175,8 @@ struct Orders {
 struct PriceState {
     btc_price: Option<f64>,
     eth_price: Option<f64>,
+    sol_price: Option<f64>,
+    xrp_price: Option<f64>,
     last_update: Option<std::time::Instant>,
 }
 
@@ -143,6 +186,8 @@ struct State {
     positions: HashMap<String, Position>,
     orders: HashMap<String, Orders>,
     prices: PriceState,
+    /// Flag to signal WebSocket needs to resubscribe with new tokens
+    needs_resubscribe: bool,
 }
 
 impl State {
@@ -152,225 +197,11 @@ impl State {
             positions: HashMap::new(),
             orders: HashMap::new(),
             prices: PriceState::default(),
+            needs_resubscribe: false,
         }
     }
 }
 
-// === Gamma API for market discovery ===
-
-#[derive(Debug, Deserialize)]
-struct GammaSeries {
-    events: Option<Vec<GammaEvent>>,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct GammaEvent {
-    slug: Option<String>,
-    title: Option<String>,
-    closed: Option<bool>,
-    markets: Option<Vec<GammaMarket>>,
-    #[serde(rename = "endDate")]
-    end_date: Option<String>,
-    #[serde(rename = "enableOrderBook")]
-    enable_order_book: Option<bool>,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct GammaMarket {
-    #[serde(rename = "conditionId")]
-    condition_id: Option<String>,
-    question: Option<String>,
-    #[serde(rename = "clobTokenIds")]
-    clob_token_ids: Option<String>,
-    outcomes: Option<String>,
-    active: Option<bool>,
-    closed: Option<bool>,
-    #[serde(rename = "endDate")]
-    end_date: Option<String>,
-    #[serde(rename = "acceptingOrders")]
-    accepting_orders: Option<bool>,
-}
-
-/// Crypto series slugs for 15-minute markets
-const POLY_SERIES_SLUGS: &[(&str, &str)] = &[
-    ("btc-up-or-down-15m", "BTC"),
-    ("eth-up-or-down-15m", "ETH"),
-];
-
-/// Discover crypto markets on Polymarket with strikes
-async fn discover_markets(market_filter: Option<&str>) -> Result<Vec<Market>> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()?;
-
-    let mut markets = Vec::new();
-
-    // Filter series if user specified an asset
-    let series_to_check: Vec<(&str, &str)> = if let Some(filter) = market_filter {
-        let filter_lower = filter.to_lowercase();
-        POLY_SERIES_SLUGS
-            .iter()
-            .filter(|(slug, asset)| {
-                slug.contains(&filter_lower) || asset.to_lowercase().contains(&filter_lower)
-            })
-            .copied()
-            .collect()
-    } else {
-        POLY_SERIES_SLUGS.to_vec()
-    };
-
-    for (series_slug, asset) in series_to_check {
-        let url = format!("{}/series?slug={}", GAMMA_API_BASE, series_slug);
-
-        let resp = client
-            .get(&url)
-            .header("User-Agent", "poly_atm_sniper/1.0")
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            warn!("[DISCOVER] Failed to fetch series '{}': {}", series_slug, resp.status());
-            continue;
-        }
-
-        let series_list: Vec<GammaSeries> = resp.json().await?;
-        let Some(series) = series_list.first() else { continue };
-        let Some(events) = &series.events else { continue };
-
-        // Collect event slugs that need fetching
-        let event_slugs: Vec<String> = events
-            .iter()
-            .filter(|e| e.closed != Some(true) && e.enable_order_book == Some(true))
-            .filter_map(|e| e.slug.clone())
-            .take(20)
-            .collect();
-
-        // Fetch each event's market details
-        for event_slug in event_slugs {
-            let event_url = format!("{}/events?slug={}", GAMMA_API_BASE, event_slug);
-            let resp = match client.get(&event_url)
-                .header("User-Agent", "poly_atm_sniper/1.0")
-                .send()
-                .await
-            {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-
-            let event_details: Vec<serde_json::Value> = match resp.json().await {
-                Ok(ed) => ed,
-                Err(_) => continue,
-            };
-
-            let Some(ed) = event_details.first() else { continue };
-            let Some(mkts) = ed.get("markets").and_then(|m| m.as_array()) else { continue };
-
-            for mkt in mkts {
-                let condition_id = mkt.get("conditionId")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                let clob_tokens_str = mkt.get("clobTokenIds")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                let question = mkt.get("question")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| event_slug.clone());
-                let end_date_str = mkt.get("endDate")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-
-                let Some(cid) = condition_id else { continue };
-                let Some(cts) = clob_tokens_str else { continue };
-
-                let token_ids: Vec<String> = serde_json::from_str(&cts).unwrap_or_default();
-                if token_ids.len() < 2 {
-                    continue;
-                }
-
-                let expiry_minutes = end_date_str.as_ref().and_then(|d| parse_expiry_minutes(d));
-
-                // Skip expired markets
-                if expiry_minutes.map(|m| m <= 0.0).unwrap_or(true) {
-                    continue;
-                }
-
-                // Parse strike from question
-                let strike = parse_strike_from_question(&question);
-
-                markets.push(Market {
-                    condition_id: cid,
-                    question,
-                    yes_token: token_ids[0].clone(),
-                    no_token: token_ids[1].clone(),
-                    strike,
-                    asset: asset.to_string(),
-                    expiry_minutes,
-                    yes_ask: None,
-                    yes_bid: None,
-                    no_ask: None,
-                    no_bid: None,
-                    yes_ask_size: 0.0,
-                    no_ask_size: 0.0,
-                });
-            }
-        }
-    }
-
-    // Deduplicate by condition_id
-    let mut seen = std::collections::HashSet::new();
-    markets.retain(|m| seen.insert(m.condition_id.clone()));
-
-    // Sort by expiry (soonest first)
-    markets.sort_by(|a, b| {
-        a.expiry_minutes
-            .unwrap_or(f64::MAX)
-            .partial_cmp(&b.expiry_minutes.unwrap_or(f64::MAX))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    Ok(markets)
-}
-
-/// Parse strike price from question text
-fn parse_strike_from_question(question: &str) -> Option<f64> {
-    // Look for patterns like "$100,000" or "100000"
-    let re_patterns = [
-        r"\$([0-9,]+(?:\.[0-9]+)?)",
-        r"([0-9]+(?:,[0-9]+)*(?:\.[0-9]+)?)\s*(?:dollars?|usd)",
-        r"above\s+\$?([0-9,]+)",
-        r"below\s+\$?([0-9,]+)",
-    ];
-
-    for pattern in re_patterns {
-        if let Ok(re) = regex_lite::Regex::new(pattern) {
-            if let Some(caps) = re.captures(&question.to_lowercase()) {
-                if let Some(m) = caps.get(1) {
-                    let num_str = m.as_str().replace(",", "");
-                    if let Ok(val) = num_str.parse::<f64>() {
-                        return Some(val);
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Parse expiry time and return minutes remaining
-fn parse_expiry_minutes(end_date: &str) -> Option<f64> {
-    let dt = chrono::DateTime::parse_from_rfc3339(end_date).ok()?;
-    let now = Utc::now();
-    let diff = dt.signed_duration_since(now);
-    let minutes = diff.num_minutes() as f64;
-    if minutes > 0.0 {
-        Some(minutes)
-    } else {
-        None
-    }
-}
 
 // === Polymarket WebSocket ===
 
@@ -417,6 +248,8 @@ struct PolygonMessage {
 struct LocalPriceUpdate {
     btc_price: Option<f64>,
     eth_price: Option<f64>,
+    sol_price: Option<f64>,
+    xrp_price: Option<f64>,
 }
 
 /// Try local price server first, fallback to direct Polygon
@@ -456,12 +289,46 @@ async fn run_local_price_feed(
             Ok(Message::Text(text)) => {
                 if let Ok(update) = serde_json::from_str::<LocalPriceUpdate>(&text) {
                     let mut s = state.write().await;
-                    if let Some(btc) = update.btc_price {
-                        s.prices.btc_price = Some(btc);
+
+                    // Current time for strike capture
+                    let now_ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+
+                    // Process each price and capture strikes
+                    let prices: Vec<(&str, Option<f64>)> = vec![
+                        ("BTC", update.btc_price),
+                        ("ETH", update.eth_price),
+                        ("SOL", update.sol_price),
+                        ("XRP", update.xrp_price),
+                    ];
+
+                    for (asset, price_opt) in prices {
+                        let Some(price) = price_opt else { continue };
+
+                        // Update price state
+                        match asset {
+                            "BTC" => s.prices.btc_price = Some(price),
+                            "ETH" => s.prices.eth_price = Some(price),
+                            "SOL" => s.prices.sol_price = Some(price),
+                            "XRP" => s.prices.xrp_price = Some(price),
+                            _ => {}
+                        }
+
+                        // Capture strike price for markets where window has started
+                        for market in s.markets.values_mut() {
+                            if market.asset == asset && market.strike_price.is_none() {
+                                if let Some(start_ts) = market.window_start_ts {
+                                    if now_ts >= start_ts {
+                                        market.strike_price = Some(price);
+                                        info!("[STRIKE] {} captured: ${:.2}", asset, price);
+                                    }
+                                }
+                            }
+                        }
                     }
-                    if let Some(eth) = update.eth_price {
-                        s.prices.eth_price = Some(eth);
-                    }
+
                     s.prices.last_update = Some(std::time::Instant::now());
                 }
             }
@@ -481,13 +348,13 @@ async fn run_direct_polygon_feed(state: Arc<RwLock<State>>, api_key: &str) -> Re
     let (ws, _) = connect_async(&url).await?;
     let (mut write, mut read) = ws.split();
 
-    // Subscribe to BTC and ETH
+    // Subscribe to all crypto pairs
     let sub = serde_json::json!({
         "action": "subscribe",
-        "params": "XT.BTC-USD,XT.ETH-USD"
+        "params": "XT.BTC-USD,XT.ETH-USD,XT.SOL-USD,XT.XRP-USD"
     });
     let _ = write.send(Message::Text(sub.to_string())).await;
-    info!("[POLYGON] Subscribed to BTC-USD, ETH-USD");
+    info!("[POLYGON] Subscribed to BTC-USD, ETH-USD, SOL-USD, XRP-USD");
 
     while let Some(msg) = read.next().await {
         match msg {
@@ -501,12 +368,43 @@ async fn run_direct_polygon_feed(state: Arc<RwLock<State>>, api_key: &str) -> Re
                         let Some(pair) = m.pair.as_ref() else { continue };
                         let Some(price) = m.p else { continue };
 
+                        let asset = match pair.as_str() {
+                            "BTC-USD" => "BTC",
+                            "ETH-USD" => "ETH",
+                            "SOL-USD" => "SOL",
+                            "XRP-USD" => "XRP",
+                            _ => continue,
+                        };
+
                         let mut s = state.write().await;
-                        if pair == "BTC-USD" {
-                            s.prices.btc_price = Some(price);
-                        } else if pair == "ETH-USD" {
-                            s.prices.eth_price = Some(price);
+
+                        // Update price state
+                        match asset {
+                            "BTC" => s.prices.btc_price = Some(price),
+                            "ETH" => s.prices.eth_price = Some(price),
+                            "SOL" => s.prices.sol_price = Some(price),
+                            "XRP" => s.prices.xrp_price = Some(price),
+                            _ => {}
                         }
+
+                        // Current time for strike capture
+                        let now_ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
+
+                        // Capture strike price for markets where window has started
+                        for market in s.markets.values_mut() {
+                            if market.asset == asset && market.strike_price.is_none() {
+                                if let Some(start_ts) = market.window_start_ts {
+                                    if now_ts >= start_ts {
+                                        market.strike_price = Some(price);
+                                        info!("[STRIKE] {} captured: ${:.2}", asset, price);
+                                    }
+                                }
+                            }
+                        }
+
                         s.prices.last_update = Some(std::time::Instant::now());
                     }
                 }
@@ -559,8 +457,12 @@ async fn main() -> Result<()> {
     info!("   ATM threshold: {:.4}%", args.atm_threshold);
     info!("   Time window: {}m - {}m before expiry", args.min_minutes, args.max_minutes);
     if let Some(ref market) = args.market {
-        info!("   Filter: {}", market);
+        info!("   Market filter: {}", market);
     }
+    if let Some(ref sym) = args.sym {
+        info!("   Asset filter: {}", sym.to_uppercase());
+    }
+    info!("   Max contracts: {}", args.max_contracts);
     info!("═══════════════════════════════════════════════════════════════════════");
 
     // Load Polymarket credentials
@@ -592,15 +494,26 @@ async fn main() -> Result<()> {
         tokio::time::sleep(Duration::from_secs(3)).await;
     }
 
-    // Discover markets
-    info!("[DISCOVER] Searching for crypto markets with strikes...");
-    let discovered = discover_markets(args.market.as_deref()).await?;
-    info!("[DISCOVER] Found {} markets", discovered.len());
+    // Discover markets using shared module
+    info!("[DISCOVER] Searching for crypto markets...");
+    let mut discovered = discover_all_markets(args.market.as_deref()).await?;
+
+    // Filter by asset symbol if specified
+    if let Some(ref sym) = args.sym {
+        let sym_upper = sym.to_uppercase();
+        discovered.retain(|m| m.asset == sym_upper);
+        info!("[DISCOVER] Filtered to {} {} markets", discovered.len(), sym_upper);
+    } else {
+        info!("[DISCOVER] Found {} markets", discovered.len());
+    }
 
     for m in &discovered {
-        info!("  • {} | Strike: {:?} | Asset: {} | Expiry: {:?}min",
-              &m.question[..m.question.len().min(60)],
-              m.strike, m.asset, m.expiry_minutes);
+        let start_info = m.window_start_ts
+            .map(|ts| format!("start_ts={}", ts))
+            .unwrap_or_else(|| "no_start".into());
+        info!("  • {} | {} | Asset: {} | Expiry: {:.1?}min",
+              &m.question[..m.question.len().min(50)],
+              start_info, m.asset, m.expiry_minutes);
     }
 
     if discovered.is_empty() {
@@ -608,14 +521,14 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Initialize state
+    // Initialize state - convert PolyMarket to Market
     let state = Arc::new(RwLock::new({
         let mut s = State::new();
-        for m in discovered {
-            let id = m.condition_id.clone();
+        for pm in discovered {
+            let id = pm.condition_id.clone();
             s.positions.insert(id.clone(), Position::default());
             s.orders.insert(id.clone(), Orders::default());
-            s.markets.insert(id, m);
+            s.markets.insert(id, Market::from_polymarket(pm));
         }
         s
     }));
@@ -640,13 +553,70 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Get token IDs for subscription
-    let tokens: Vec<String> = {
-        let s = state.read().await;
-        s.markets.values()
-            .flat_map(|m| vec![m.yes_token.clone(), m.no_token.clone()])
-            .collect()
-    };
+    // Start periodic market discovery task
+    let state_for_discovery = state.clone();
+    let discovery_filter = args.sym.clone();
+    let market_filter = args.market.clone();
+    tokio::spawn(async move {
+        // Wait 15 seconds before first refresh (we just discovered markets)
+        tokio::time::sleep(Duration::from_secs(15)).await;
+
+        loop {
+            debug!("[DISCOVER] Checking for new markets...");
+            match discover_all_markets(market_filter.as_deref()).await {
+                Ok(mut discovered) => {
+                    // Filter by asset symbol if specified
+                    if let Some(ref sym) = discovery_filter {
+                        let sym_upper = sym.to_uppercase();
+                        discovered.retain(|m| m.asset == sym_upper);
+                    }
+
+                    let mut s = state_for_discovery.write().await;
+                    let mut new_count = 0;
+                    let mut expired_count = 0;
+
+                    // Remove expired markets (expiry <= 0)
+                    let expired_ids: Vec<String> = s.markets.iter()
+                        .filter(|(_, m)| m.time_remaining_mins().unwrap_or(0.0) <= 0.0)
+                        .map(|(id, _)| id.clone())
+                        .collect();
+
+                    for id in expired_ids {
+                        s.markets.remove(&id);
+                        s.positions.remove(&id);
+                        s.orders.remove(&id);
+                        expired_count += 1;
+                    }
+
+                    // Add new markets
+                    for pm in discovered {
+                        let id = pm.condition_id.clone();
+                        if !s.markets.contains_key(&id) {
+                            info!("[DISCOVER] 🆕 New market: {} | {} | {:.1?}min",
+                                  pm.asset, &pm.question[..pm.question.len().min(40)], pm.expiry_minutes);
+                            s.positions.insert(id.clone(), Position::default());
+                            s.orders.insert(id.clone(), Orders::default());
+                            s.markets.insert(id, Market::from_polymarket(pm));
+                            new_count += 1;
+                        }
+                    }
+
+                    if new_count > 0 || expired_count > 0 {
+                        info!("[DISCOVER] Added {} new markets, removed {} expired", new_count, expired_count);
+                        if new_count > 0 {
+                            s.needs_resubscribe = true;
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("[DISCOVER] Market discovery failed: {}", e);
+                }
+            }
+
+            // Check every 15 seconds for new markets
+            tokio::time::sleep(Duration::from_secs(15)).await;
+        }
+    });
 
     // Main WebSocket loop
     let bid_price = args.bid;
@@ -655,8 +625,24 @@ async fn main() -> Result<()> {
     let dry_run = !args.live;
     let min_minutes = args.min_minutes as f64;
     let max_minutes = args.max_minutes as f64;
+    let max_contracts = args.max_contracts;
 
     loop {
+        // Get current token IDs from state (may have new markets)
+        let tokens: Vec<String> = {
+            let mut s = state.write().await;
+            s.needs_resubscribe = false; // Clear flag
+            s.markets.values()
+                .flat_map(|m| vec![m.yes_token.clone(), m.no_token.clone()])
+                .collect()
+        };
+
+        if tokens.is_empty() {
+            info!("[WS] No markets to subscribe to, waiting...");
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            continue;
+        }
+
         info!("[WS] Connecting to Polymarket...");
 
         let (ws, _) = match connect_async(POLYMARKET_WS_URL).await {
@@ -676,13 +662,26 @@ async fn main() -> Result<()> {
             sub_type: "market",
         };
         let _ = write.send(Message::Text(serde_json::to_string(&sub)?)).await;
-        info!("[WS] Subscribed to {} tokens", tokens.len());
+        info!("[WS] Subscribed to {} tokens ({} markets)", tokens.len(), tokens.len() / 2);
 
         let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
         let mut status_interval = tokio::time::interval(Duration::from_secs(5));
+        let mut resub_check_interval = tokio::time::interval(Duration::from_secs(2));
 
         loop {
             tokio::select! {
+                _ = resub_check_interval.tick() => {
+                    // Check if we need to resubscribe for new markets
+                    let needs_resub = {
+                        let s = state.read().await;
+                        s.needs_resubscribe
+                    };
+                    if needs_resub {
+                        info!("[WS] New markets discovered, reconnecting to subscribe...");
+                        break;
+                    }
+                }
+
                 _ = ping_interval.tick() => {
                     if let Err(e) = write.send(Message::Ping(vec![])).await {
                         error!("[WS] Ping failed: {}", e);
@@ -692,29 +691,52 @@ async fn main() -> Result<()> {
 
                 _ = status_interval.tick() => {
                     let s = state.read().await;
-                    let spot_btc = s.prices.btc_price.map(|p| format!("{:.2}", p)).unwrap_or("-".into());
-                    let spot_eth = s.prices.eth_price.map(|p| format!("{:.2}", p)).unwrap_or("-".into());
 
-                    info!("[STATUS] BTC=${} ETH={}", spot_btc, spot_eth);
+                    // Build price string based on which assets we're trading
+                    let price_str = if let Some(ref sym) = args.sym {
+                        match sym.to_uppercase().as_str() {
+                            "BTC" => format!("BTC=${}", s.prices.btc_price.map(|p| format!("{:.2}", p)).unwrap_or("-".into())),
+                            "ETH" => format!("ETH=${}", s.prices.eth_price.map(|p| format!("{:.2}", p)).unwrap_or("-".into())),
+                            "SOL" => format!("SOL=${}", s.prices.sol_price.map(|p| format!("{:.2}", p)).unwrap_or("-".into())),
+                            "XRP" => format!("XRP=${}", s.prices.xrp_price.map(|p| format!("{:.4}", p)).unwrap_or("-".into())),
+                            _ => "?".into(),
+                        }
+                    } else {
+                        format!("BTC=${} ETH={}",
+                            s.prices.btc_price.map(|p| format!("{:.2}", p)).unwrap_or("-".into()),
+                            s.prices.eth_price.map(|p| format!("{:.2}", p)).unwrap_or("-".into()))
+                    };
+
+                    // Calculate total position
+                    let total_yes: f64 = s.positions.values().map(|p| p.yes_qty).sum();
+                    let total_no: f64 = s.positions.values().map(|p| p.no_qty).sum();
+                    let total_cost: f64 = s.positions.values().map(|p| p.yes_cost + p.no_cost).sum();
+                    let matched = total_yes.min(total_no);
+                    let locked_profit = matched - total_cost; // $1 payout per matched pair minus cost
+
+                    info!("[STATUS] {} | Pos: Y={:.1} N={:.1} matched={:.1} | Cost=${:.2} Profit=${:.2} | {:.0}/{:.0}",
+                          price_str, total_yes, total_no, matched, total_cost, locked_profit, total_yes + total_no, max_contracts);
 
                     for (id, market) in &s.markets {
                         let pos = s.positions.get(id).cloned().unwrap_or_default();
                         let orders = s.orders.get(id).cloned().unwrap_or_default();
 
-                        // Get spot for this market's asset
-                        let spot = if market.asset == "ETH" {
-                            s.prices.eth_price
-                        } else {
-                            s.prices.btc_price
+                        // Get spot price for this asset
+                        let spot = match market.asset.as_str() {
+                            "BTC" => s.prices.btc_price,
+                            "ETH" => s.prices.eth_price,
+                            "SOL" => s.prices.sol_price,
+                            "XRP" => s.prices.xrp_price,
+                            _ => None,
                         };
 
-                        let expiry = market.expiry_minutes.unwrap_or(0.0);
+                        let expiry = market.time_remaining_mins().unwrap_or(0.0);
                         if expiry < min_minutes || expiry > max_minutes {
                             continue;
                         }
 
-                        // Check ATM status
-                        let (atm_status, dist_pct) = match (spot, market.strike) {
+                        // Check ATM status using captured strike price
+                        let (atm_status, dist_pct) = match (spot, market.strike_price) {
                             (Some(s), Some(k)) => {
                                 let dist = distance_from_strike_pct(s, k);
                                 let is_atm_now = dist <= atm_threshold;
@@ -725,7 +747,8 @@ async fn main() -> Result<()> {
                                 };
                                 (status, format!("{:.4}%", dist))
                             }
-                            _ => ("❓ NO DATA", "-".into()),
+                            (_, None) => ("⏳ WAIT", "-".into()), // Waiting for strike to be captured
+                            _ => ("❓ NO PRICE", "-".into()),
                         };
 
                         let yes_ask = market.yes_ask.unwrap_or(100);
@@ -737,10 +760,27 @@ async fn main() -> Result<()> {
                             orders.no_order_id.as_ref().map(|_| "📝").unwrap_or("-")
                         );
 
-                        info!("  [{}] {} | {:.1}m | {} dist={} | Ask Y={}¢ N={}¢ | {} | Pos: Y={:.1} N={:.1}",
+                        let strike_str = market.strike_price
+                            .map(|s| format!("${:.0}", s))
+                            .unwrap_or_else(|| "?".into());
+
+                        // Calculate end time (window_start + 15 minutes)
+                        let end_time_str = market.window_start_ts
+                            .map(|start_ts| {
+                                let end_ts = start_ts + 15 * 60; // 15 minutes after start
+                                Utc.timestamp_opt(end_ts, 0)
+                                    .single()
+                                    .map(|dt| dt.format("%H:%M:%S").to_string())
+                                    .unwrap_or_else(|| "?".into())
+                            })
+                            .unwrap_or_else(|| "?".into());
+
+                        info!("  [{}] {} | {:.1}m ends@{} | strike={} | {} dist={} | Y={}¢ N={}¢ | {} | Pos: Y={:.1} N={:.1}",
                               market.asset,
-                              &market.question[..market.question.len().min(40)],
+                              &market.question[..market.question.len().min(35)],
                               expiry,
+                              end_time_str,
+                              strike_str,
                               atm_status, dist_pct,
                               yes_ask, no_ask,
                               order_status,
@@ -783,6 +823,8 @@ async fn main() -> Result<()> {
                                     // Get prices and market data first
                                     let btc_price = s.prices.btc_price;
                                     let eth_price = s.prices.eth_price;
+                                    let sol_price = s.prices.sol_price;
+                                    let xrp_price = s.prices.xrp_price;
 
                                     let Some(market) = s.markets.get_mut(&market_id) else { continue };
 
@@ -800,8 +842,8 @@ async fn main() -> Result<()> {
 
                                     // Extract values for trading logic
                                     let asset = market.asset.clone();
-                                    let strike = market.strike;
-                                    let expiry = market.expiry_minutes;
+                                    let strike = market.strike_price;
+                                    let expiry = market.time_remaining_mins();
                                     let yes_ask_price = market.yes_ask;
                                     let no_ask_price = market.no_ask;
                                     let yes_token = market.yes_token.clone();
@@ -812,7 +854,13 @@ async fn main() -> Result<()> {
                                     let orders = s.orders.get(&market_id).cloned().unwrap_or_default();
 
                                     // Get spot price based on asset
-                                    let spot = if asset == "ETH" { eth_price } else { btc_price };
+                                    let spot = match asset.as_str() {
+                                        "BTC" => btc_price,
+                                        "ETH" => eth_price,
+                                        "SOL" => sol_price,
+                                        "XRP" => xrp_price,
+                                        _ => None,
+                                    };
 
                                     // Check if within time window
                                     let mins = expiry.unwrap_or(0.0);
@@ -837,6 +885,19 @@ async fn main() -> Result<()> {
                                     // ATM! Check if we should bid
                                     let market_id_clone = market_id.clone();
                                     drop(s);
+
+                                    // Check if we've hit max contracts limit
+                                    let total_position = {
+                                        let s = state.read().await;
+                                        s.positions.values()
+                                            .map(|p| p.yes_qty + p.no_qty)
+                                            .sum::<f64>()
+                                    };
+
+                                    if total_position >= max_contracts {
+                                        debug!("[SKIP] Max contracts reached: {:.1} >= {:.1}", total_position, max_contracts);
+                                        continue;
+                                    }
 
                                     // Determine if we need to place orders
                                     let need_yes = orders.yes_order_id.is_none();
@@ -874,15 +935,28 @@ async fn main() -> Result<()> {
                                         // Place YES bid
                                         if need_yes && yes_worth_bidding {
                                             let price = bid_price as f64 / 100.0;
+                                            let current_ask = yes_ask_price.unwrap_or(0);
 
-                                            warn!("[TRADE] 📝 BID {} contracts YES @{}¢ | delta≈0.50 | {}",
-                                                  contracts, bid_price, asset);
+                                            // Polymarket requires minimum $1 order value - scale up contracts if needed
+                                            let min_contracts = (1.0 / price).ceil();
+                                            let actual_contracts = contracts.max(min_contracts);
+                                            let cost = actual_contracts * price;
 
-                                            match shared_client.buy_fak(&yes_token, price, contracts).await {
+                                            // Skip if still below $1 minimum
+                                            if cost < 1.0 {
+                                                debug!("[SKIP] YES order ${:.2} below $1 minimum", cost);
+                                                continue;
+                                            }
+
+                                            warn!("[TRADE] 📝 BID {} contracts YES @{}¢ | ask={}¢ | delta≈0.50 | {}",
+                                                  actual_contracts, bid_price, current_ask, asset);
+
+                                            match shared_client.buy_fak(&yes_token, price, actual_contracts).await {
                                                 Ok(fill) => {
                                                     if fill.filled_size > 0.0 {
-                                                        warn!("[TRADE] ✅ YES Filled {:.2} @${:.2} | order_id={}",
-                                                              fill.filled_size, fill.fill_cost, fill.order_id);
+                                                        let fill_price_cents = (fill.fill_cost / fill.filled_size * 100.0).round() as i64;
+                                                        warn!("[TRADE] ✅ YES Filled {:.2} @{}¢ (total ${:.2}) | ask was {}¢ | order_id={}",
+                                                              fill.filled_size, fill_price_cents, fill.fill_cost, current_ask, fill.order_id);
                                                         // Update position
                                                         let mut s = state.write().await;
                                                         if let Some(pos) = s.positions.get_mut(&market_id_clone) {
@@ -900,15 +974,28 @@ async fn main() -> Result<()> {
                                         // Place NO bid
                                         if need_no && no_worth_bidding {
                                             let price = bid_price as f64 / 100.0;
+                                            let current_ask = no_ask_price.unwrap_or(0);
 
-                                            warn!("[TRADE] 📝 BID {} contracts NO @{}¢ | delta≈0.50 | {}",
-                                                  contracts, bid_price, asset);
+                                            // Polymarket requires minimum $1 order value - scale up contracts if needed
+                                            let min_contracts = (1.0 / price).ceil();
+                                            let actual_contracts = contracts.max(min_contracts);
+                                            let cost = actual_contracts * price;
 
-                                            match shared_client.buy_fak(&no_token, price, contracts).await {
+                                            // Skip if still below $1 minimum
+                                            if cost < 1.0 {
+                                                debug!("[SKIP] NO order ${:.2} below $1 minimum", cost);
+                                                continue;
+                                            }
+
+                                            warn!("[TRADE] 📝 BID {} contracts NO @{}¢ | ask={}¢ | delta≈0.50 | {}",
+                                                  actual_contracts, bid_price, current_ask, asset);
+
+                                            match shared_client.buy_fak(&no_token, price, actual_contracts).await {
                                                 Ok(fill) => {
                                                     if fill.filled_size > 0.0 {
-                                                        warn!("[TRADE] ✅ NO Filled {:.2} @${:.2} | order_id={}",
-                                                              fill.filled_size, fill.fill_cost, fill.order_id);
+                                                        let fill_price_cents = (fill.fill_cost / fill.filled_size * 100.0).round() as i64;
+                                                        warn!("[TRADE] ✅ NO Filled {:.2} @{}¢ (total ${:.2}) | ask was {}¢ | order_id={}",
+                                                              fill.filled_size, fill_price_cents, fill.fill_cost, current_ask, fill.order_id);
                                                         // Update position
                                                         let mut s = state.write().await;
                                                         if let Some(pos) = s.positions.get_mut(&market_id_clone) {

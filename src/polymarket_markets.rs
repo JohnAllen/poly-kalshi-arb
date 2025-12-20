@@ -111,12 +111,31 @@ pub async fn discover_markets(asset_filter: Option<&str>) -> Result<Vec<PolyMark
         let Some(series) = series_list.first() else { continue };
         let Some(events) = &series.events else { continue };
 
-        // Events are sorted oldest-first, reverse to get soonest future events
+        // Get current timestamp to find active/near-future markets
+        let now_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        // Find markets that have started (slug timestamp <= now) but not closed
+        // Events are sorted oldest-first, so iterate forward to find recent ones
         let event_slugs: Vec<String> = events
             .iter()
-            .rev()
             .filter(|e| e.closed != Some(true) && e.enable_order_book == Some(true))
-            .filter_map(|e| e.slug.clone())
+            .filter_map(|e| {
+                let slug = e.slug.as_ref()?;
+                // Extract timestamp from slug (e.g., "btc-updown-15m-1766190600")
+                let ts: i64 = slug.rsplit('-').next()?.parse().ok()?;
+                // Keep markets where window has started (ts <= now) or starts within 16 min
+                if ts <= now_ts + 960 {
+                    Some(slug.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev() // Now reverse to get most recent (closest to now) first
             .take(3)
             .collect();
 
@@ -245,12 +264,25 @@ pub async fn discover_all_markets(asset_filter: Option<&str>) -> Result<Vec<Poly
         let Some(series) = series_list.first() else { continue };
         let Some(events) = &series.events else { continue };
 
-        // Events are sorted oldest-first, reverse to get soonest future events
+        // Get current timestamp to find active/near-future markets
+        let now_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        // Find markets that have started or start within 16 minutes
         let event_slugs: Vec<String> = events
             .iter()
-            .rev()
             .filter(|e| e.closed != Some(true) && e.enable_order_book == Some(true))
-            .filter_map(|e| e.slug.clone())
+            .filter_map(|e| {
+                let slug = e.slug.as_ref()?;
+                let ts: i64 = slug.rsplit('-').next()?.parse().ok()?;
+                if ts <= now_ts + 960 {
+                    Some(slug.clone())
+                } else {
+                    None
+                }
+            })
             .collect();
 
         for event_slug in event_slugs {

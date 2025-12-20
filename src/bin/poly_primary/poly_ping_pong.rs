@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use arb_bot::polymarket_clob::{PolymarketAsyncClient, PreparedCreds, SharedAsyncClient};
 
@@ -46,6 +46,10 @@ struct Args {
     /// Number of contracts to buy per trade
     #[arg(short, long, default_value_t = 1.0)]
     contracts: f64,
+
+    /// Maximum total contracts to hold (default: 10)
+    #[arg(short = 'm', long, default_value_t = 10.0)]
+    max_contracts: f64,
 
     /// Live trading mode (default is dry run)
     #[arg(short, long, default_value_t = false)]
@@ -113,6 +117,20 @@ impl Market {
             diff.num_seconds() as f64 / 60.0
         })
     }
+
+    /// Extract strike price from question (e.g., "Will SOL be above $126.00..." -> "$126.00")
+    fn pin_name(&self) -> String {
+        // Try to extract strike price like "$126.00" or "$97,000.00"
+        if let Some(start) = self.question.find('$') {
+            let rest = &self.question[start..];
+            // Find end of price (space, "at", or end of string)
+            let end = rest.find(|c: char| c == ' ' || c == '?')
+                .unwrap_or(rest.len());
+            return rest[..end].to_string();
+        }
+        // Fallback to first 20 chars of question
+        self.question.chars().take(20).collect()
+    }
 }
 
 /// Position tracking
@@ -132,10 +150,6 @@ impl Position {
     }
     fn total_cost(&self) -> f64 {
         self.yes_cost + self.no_cost
-    }
-    fn locked_profit(&self) -> f64 {
-        // Matched pairs pay $1
-        self.matched() - self.total_cost()
     }
 }
 
@@ -165,34 +179,82 @@ async fn run_price_feed(state: Arc<RwLock<State>>) {
             Ok((ws, _)) => {
                 info!("[PRICES] Connected to local price server");
                 let (mut write, mut read) = ws.split();
+                let mut msg_count: u64 = 0;
 
                 while let Some(msg) = read.next().await {
                     match msg {
                         Ok(Message::Text(text)) => {
-                            if let Ok(update) = serde_json::from_str::<LocalPriceUpdate>(&text) {
-                                let mut s = state.write().await;
-                                if let Some(btc) = update.btc_price {
-                                    s.prices.btc_price = Some(btc);
+                            msg_count += 1;
+                            trace!("[PRICES] Raw message #{}: {}", msg_count, &text[..text.len().min(200)]);
+
+                            match serde_json::from_str::<LocalPriceUpdate>(&text) {
+                                Ok(update) => {
+                                    let mut s = state.write().await;
+                                    let mut changes = Vec::new();
+
+                                    if let Some(btc) = update.btc_price {
+                                        let old = s.prices.btc_price;
+                                        s.prices.btc_price = Some(btc);
+                                        if old != Some(btc) {
+                                            changes.push(format!("BTC: ${:.2}", btc));
+                                        }
+                                    }
+                                    if let Some(eth) = update.eth_price {
+                                        let old = s.prices.eth_price;
+                                        s.prices.eth_price = Some(eth);
+                                        if old != Some(eth) {
+                                            changes.push(format!("ETH: ${:.2}", eth));
+                                        }
+                                    }
+                                    if let Some(sol) = update.sol_price {
+                                        let old = s.prices.sol_price;
+                                        s.prices.sol_price = Some(sol);
+                                        if old != Some(sol) {
+                                            changes.push(format!("SOL: ${:.4}", sol));
+                                        }
+                                    }
+                                    if let Some(xrp) = update.xrp_price {
+                                        let old = s.prices.xrp_price;
+                                        s.prices.xrp_price = Some(xrp);
+                                        if old != Some(xrp) {
+                                            changes.push(format!("XRP: ${:.4}", xrp));
+                                        }
+                                    }
+                                    s.prices.last_update = Some(std::time::Instant::now());
+
+                                    if !changes.is_empty() {
+                                        debug!("[PRICES] Updated: {}", changes.join(", "));
+                                    }
                                 }
-                                if let Some(eth) = update.eth_price {
-                                    s.prices.eth_price = Some(eth);
+                                Err(e) => {
+                                    debug!("[PRICES] Parse error: {} - msg: {}", e, &text[..text.len().min(100)]);
                                 }
-                                if let Some(sol) = update.sol_price {
-                                    s.prices.sol_price = Some(sol);
-                                }
-                                if let Some(xrp) = update.xrp_price {
-                                    s.prices.xrp_price = Some(xrp);
-                                }
-                                s.prices.last_update = Some(std::time::Instant::now());
                             }
                         }
                         Ok(Message::Ping(data)) => {
+                            trace!("[PRICES] Received ping, sending pong");
                             let _ = write.send(Message::Pong(data)).await;
                         }
-                        Ok(Message::Close(_)) | Err(_) => break,
-                        _ => {}
+                        Ok(Message::Pong(_)) => {
+                            trace!("[PRICES] Received pong");
+                        }
+                        Ok(Message::Close(frame)) => {
+                            warn!("[PRICES] Received close frame: {:?}", frame);
+                            break;
+                        }
+                        Ok(Message::Binary(data)) => {
+                            debug!("[PRICES] Received binary message: {} bytes", data.len());
+                        }
+                        Ok(Message::Frame(_)) => {
+                            trace!("[PRICES] Received raw frame");
+                        }
+                        Err(e) => {
+                            error!("[PRICES] WebSocket error: {}", e);
+                            break;
+                        }
                     }
                 }
+                info!("[PRICES] Connection closed after {} messages", msg_count);
             }
             Err(e) => {
                 warn!("[PRICES] Failed to connect: {}", e);
@@ -233,6 +295,8 @@ const POLY_SERIES_SLUGS: &[(&str, &str)] = &[
 
 /// Discover crypto markets on Polymarket
 async fn discover_markets(market_filter: Option<&str>) -> Result<Vec<Market>> {
+    info!("[DISCOVER] Starting market discovery, filter={:?}", market_filter);
+
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()?;
@@ -252,8 +316,11 @@ async fn discover_markets(market_filter: Option<&str>) -> Result<Vec<Market>> {
         POLY_SERIES_SLUGS.to_vec()
     };
 
+    debug!("[DISCOVER] Checking {} series: {:?}", series_to_check.len(), series_to_check);
+
     for (series_slug, asset) in series_to_check {
         let url = format!("{}/series?slug={}", GAMMA_API_BASE, series_slug);
+        debug!("[DISCOVER] Fetching series: {}", url);
 
         let resp = client
             .get(&url)
@@ -261,22 +328,29 @@ async fn discover_markets(market_filter: Option<&str>) -> Result<Vec<Market>> {
             .send()
             .await?;
 
-        if !resp.status().is_success() {
+        let status = resp.status();
+        debug!("[DISCOVER] Series '{}' response: {}", series_slug, status);
+
+        if !status.is_success() {
             warn!(
                 "[DISCOVER] Failed to fetch series '{}': {}",
                 series_slug,
-                resp.status()
+                status
             );
             continue;
         }
 
         let series_list: Vec<GammaSeries> = resp.json().await?;
         let Some(series) = series_list.first() else {
+            debug!("[DISCOVER] No series data for '{}'", series_slug);
             continue;
         };
         let Some(events) = &series.events else {
+            debug!("[DISCOVER] No events in series '{}'", series_slug);
             continue;
         };
+
+        debug!("[DISCOVER] Series '{}' has {} events", series_slug, events.len());
 
         let event_slugs: Vec<String> = events
             .iter()
@@ -285,8 +359,12 @@ async fn discover_markets(market_filter: Option<&str>) -> Result<Vec<Market>> {
             .take(20)
             .collect();
 
+        debug!("[DISCOVER] {} open events with orderbook: {:?}", event_slugs.len(), &event_slugs[..event_slugs.len().min(5)]);
+
         for event_slug in event_slugs {
             let event_url = format!("{}/events?slug={}", GAMMA_API_BASE, event_slug);
+            trace!("[DISCOVER] Fetching event: {}", event_url);
+
             let resp = match client
                 .get(&event_url)
                 .header("User-Agent", "poly_ping_pong/1.0")
@@ -294,20 +372,30 @@ async fn discover_markets(market_filter: Option<&str>) -> Result<Vec<Market>> {
                 .await
             {
                 Ok(r) => r,
-                Err(_) => continue,
+                Err(e) => {
+                    debug!("[DISCOVER] Failed to fetch event '{}': {}", event_slug, e);
+                    continue;
+                }
             };
 
             let event_details: Vec<serde_json::Value> = match resp.json().await {
                 Ok(ed) => ed,
-                Err(_) => continue,
+                Err(e) => {
+                    debug!("[DISCOVER] Failed to parse event '{}': {}", event_slug, e);
+                    continue;
+                }
             };
 
             let Some(ed) = event_details.first() else {
+                debug!("[DISCOVER] No event details for '{}'", event_slug);
                 continue;
             };
             let Some(mkts) = ed.get("markets").and_then(|m| m.as_array()) else {
+                debug!("[DISCOVER] No markets in event '{}'", event_slug);
                 continue;
             };
+
+            trace!("[DISCOVER] Event '{}' has {} markets", event_slug, mkts.len());
 
             for mkt in mkts {
                 let condition_id = mkt
@@ -329,22 +417,29 @@ async fn discover_markets(market_filter: Option<&str>) -> Result<Vec<Market>> {
                     .map(|s| s.to_string());
 
                 let Some(cid) = condition_id else {
+                    trace!("[DISCOVER] Market missing conditionId");
                     continue;
                 };
                 let Some(cts) = clob_tokens_str else {
+                    trace!("[DISCOVER] Market {} missing clobTokenIds", cid);
                     continue;
                 };
 
                 let token_ids: Vec<String> = serde_json::from_str(&cts).unwrap_or_default();
                 if token_ids.len() < 2 {
+                    trace!("[DISCOVER] Market {} has < 2 tokens", cid);
                     continue;
                 }
 
                 let end_time = end_date_str.as_ref().and_then(|d| parse_end_time(d));
 
                 if end_time.is_none() {
+                    trace!("[DISCOVER] Market {} has no valid end_time (date={})", cid, end_date_str.as_deref().unwrap_or("none"));
                     continue;
                 }
+
+                debug!("[DISCOVER] Found market: {} | {} | end={:?} | yes={} no={}",
+                       asset, &question[..question.len().min(40)], end_time, &token_ids[0][..8], &token_ids[1][..8]);
 
                 markets.push(Market {
                     condition_id: cid,
@@ -364,18 +459,31 @@ async fn discover_markets(market_filter: Option<&str>) -> Result<Vec<Market>> {
         }
     }
 
+    let before_dedup = markets.len();
     let mut seen = std::collections::HashSet::new();
     markets.retain(|m| seen.insert(m.condition_id.clone()));
+    debug!("[DISCOVER] Deduplicated: {} -> {} markets", before_dedup, markets.len());
 
     // Only keep markets expiring within 16 minutes
+    let before_filter = markets.len();
     markets.retain(|m| {
-        m.minutes_remaining().map(|mins| mins > 0.0 && mins <= 16.0).unwrap_or(false)
+        let keep = m.minutes_remaining().map(|mins| mins > 0.0 && mins <= 16.0).unwrap_or(false);
+        if !keep {
+            trace!("[DISCOVER] Filtered out {} (mins={:?})", m.asset, m.minutes_remaining());
+        }
+        keep
     });
+    debug!("[DISCOVER] Time filter: {} -> {} markets (kept those expiring in 0-16 mins)", before_filter, markets.len());
 
     markets.sort_by(|a, b| {
         a.end_time
             .cmp(&b.end_time)
     });
+
+    info!("[DISCOVER] Discovery complete: {} markets found", markets.len());
+    for m in &markets {
+        info!("[DISCOVER]   {} | {:.1}m left | {}", m.asset, m.minutes_remaining().unwrap_or(0.0), &m.question[..m.question.len().min(50)]);
+    }
 
     Ok(markets)
 }
@@ -440,10 +548,11 @@ async fn main() -> Result<()> {
     println!("═══════════════════════════════════════════════════════════════════════");
     println!("POLYMARKET PING PONG BOT");
     println!("═══════════════════════════════════════════════════════════════════════");
-    println!("Symbol: {}  |  Mode: {}  |  Contracts: {:.0}",
+    println!("Symbol: {}  |  Mode: {}  |  Contracts: {:.0}  |  Max: {:.0}",
              args.sym.to_uppercase(),
              if args.live { "LIVE" } else { "DRY RUN" },
-             args.contracts);
+             args.contracts,
+             args.max_contracts);
     println!("Threshold: {}c / {}c  |  Max arb: {}c  |  Time: {}m-{}m  |  Max age: {:.0}m",
              args.threshold, 100 - args.threshold, args.max_arb_cost,
              args.min_minutes, args.max_minutes, args.max_age);
@@ -504,17 +613,10 @@ async fn main() -> Result<()> {
         run_price_feed(state_price).await;
     });
 
-    let tokens: Vec<String> = {
-        let s = state.read().await;
-        s.markets
-            .values()
-            .flat_map(|m| vec![m.yes_token.clone(), m.no_token.clone()])
-            .collect()
-    };
-
     let threshold = args.threshold;
     let max_arb_cost = args.max_arb_cost;
     let contracts = args.contracts;
+    let max_contracts = args.max_contracts;
     let dry_run = !args.live;
     let min_minutes = args.min_minutes as f64;
     let max_minutes = args.max_minutes as f64;
@@ -522,6 +624,41 @@ async fn main() -> Result<()> {
     let log_filter = symbol_filter.clone();
 
     loop {
+        // Get current tokens from state (may have been updated by re-discovery)
+        let tokens: Vec<String> = {
+            let s = state.read().await;
+            s.markets
+                .values()
+                .flat_map(|m| vec![m.yes_token.clone(), m.no_token.clone()])
+                .collect()
+        };
+
+        if tokens.is_empty() {
+            info!("[DISCOVER] No markets in state, discovering new markets...");
+            match discover_markets(symbol_filter.as_deref()).await {
+                Ok(discovered) => {
+                    if discovered.is_empty() {
+                        warn!("[DISCOVER] No markets found, waiting 30s...");
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        continue;
+                    }
+                    let mut s = state.write().await;
+                    for m in discovered {
+                        let id = m.condition_id.clone();
+                        s.positions.entry(id.clone()).or_insert_with(Position::default);
+                        s.markets.insert(id, m);
+                    }
+                    info!("[DISCOVER] Added {} new markets to state", s.markets.len());
+                }
+                Err(e) => {
+                    error!("[DISCOVER] Discovery failed: {}", e);
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    continue;
+                }
+            }
+            continue; // Re-loop to get the tokens
+        }
+
         info!("[WS] Connecting to Polymarket WebSocket {}...", POLYMARKET_WS_URL);
 
         let (ws, _) = match connect_async(POLYMARKET_WS_URL).await {
@@ -541,9 +678,11 @@ async fn main() -> Result<()> {
         };
         let _ = write.send(Message::Text(serde_json::to_string(&sub)?)).await;
         info!("[WS] Connected! Subscribed to {} tokens across {} markets", tokens.len(), tokens.len() / 2);
-        println!("══════════════════════════════════════════════════════════════════════════════════════════════════════");
-        println!("Sym=Asset | age=market age | left=time to expiry | YES bid/ask | NO bid/ask | sp=spread | liq=liquidity");
-        println!("══════════════════════════════════════════════════════════════════════════════════════════════════════");
+        println!("═════════════════════════════════════════════════════════════════════════════════════════════════════════════");
+        println!("STRATEGY: poly_ping_pong - Buy when price crashes to threshold, arb when YES+NO is cheap");
+        println!("═════════════════════════════════════════════════════════════════════════════════════════════════════════════");
+        println!("Sym PIN spot=price | age=market age | left=time to expiry | YES bid/ask | NO bid/ask | liq=liquidity");
+        println!("═════════════════════════════════════════════════════════════════════════════════════════════════════════════");
 
         let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
         let mut status_interval = tokio::time::interval(Duration::from_secs(1));
@@ -551,13 +690,43 @@ async fn main() -> Result<()> {
         loop {
             tokio::select! {
                 _ = ping_interval.tick() => {
+                    trace!("[WS] Sending ping...");
                     if let Err(e) = write.send(Message::Ping(vec![])).await {
                         error!("[WS] Ping failed: {}", e);
                         break;
                     }
+                    trace!("[WS] Ping sent successfully");
                 }
 
                 _ = status_interval.tick() => {
+                    // Check for expired markets and remove them
+                    let needs_rediscovery = {
+                        let mut s = state.write().await;
+                        let expired_ids: Vec<String> = s.markets
+                            .iter()
+                            .filter(|(_, m)| {
+                                m.minutes_remaining().map(|mins| mins < -1.0).unwrap_or(true)
+                            })
+                            .map(|(id, _)| id.clone())
+                            .collect();
+
+                        for id in &expired_ids {
+                            if let Some(m) = s.markets.remove(id) {
+                                info!("[EXPIRE] Removed expired market: {} {} ({})",
+                                      m.asset, m.pin_name(), &id[..16]);
+                            }
+                            s.positions.remove(id);
+                        }
+
+                        s.markets.is_empty()
+                    };
+
+                    // If all markets expired, break to re-discover
+                    if needs_rediscovery {
+                        info!("[DISCOVER] All markets expired, breaking to re-discover...");
+                        break;
+                    }
+
                     let s = state.read().await;
                     let now = Utc::now().format("%H:%M:%S");
 
@@ -579,12 +748,16 @@ async fn main() -> Result<()> {
                         let expiry = market.minutes_remaining().unwrap_or(0.0);
                         let market_age = 15.0 - expiry; // How many minutes into the market
 
-                        if expiry < min_minutes || expiry > max_minutes {
-                            continue;
-                        }
-                        if market_age > max_age {
-                            continue; // Market too old
-                        }
+                        // Determine filter status
+                        let filter_reason = if expiry < min_minutes {
+                            Some(format!("EXPIRING ({:.1}m < {:.0}m)", expiry, min_minutes))
+                        } else if expiry > max_minutes {
+                            Some(format!("TOO FAR ({:.1}m > {:.0}m)", expiry, max_minutes))
+                        } else if market_age > max_age {
+                            Some(format!("TOO OLD (age {:.1}m > {:.0}m)", market_age, max_age))
+                        } else {
+                            None
+                        };
 
                         // Get spot price for this asset
                         let spot = match market.asset.as_str() {
@@ -600,10 +773,6 @@ async fn main() -> Result<()> {
                         let yes_bid = market.yes_bid.unwrap_or(0);
                         let no_bid = market.no_bid.unwrap_or(0);
                         let combined = yes_ask + no_ask;
-
-                        // Spreads
-                        let yes_spread = yes_ask - yes_bid;
-                        let no_spread = no_ask - no_bid;
 
                         // Arb analysis
                         let arb_profit = if combined < 100 { 100 - combined } else { 0 };
@@ -622,19 +791,21 @@ async fn main() -> Result<()> {
                             String::new()
                         };
 
-                        // Position P&L (if any position)
-                        let pnl_str = if pos.yes_qty > 0.0 || pos.no_qty > 0.0 {
+                        // Position display
+                        let total_pos = pos.yes_qty + pos.no_qty;
+                        let pos_str = if total_pos > 0.0 {
                             let matched = pos.matched();
                             let unrealized = matched * 1.0 - pos.total_cost();
-                            format!(" | PnL=${:.2} (Y={:.0}@{:.0}c N={:.0}@{:.0}c)",
-                                unrealized,
+                            format!("pos={:.0}/{:.0} Y={:.0}@{:.0}c N={:.0}@{:.0}c PnL=${:.2}",
+                                total_pos, max_contracts,
                                 pos.yes_qty,
                                 if pos.yes_qty > 0.0 { pos.yes_cost / pos.yes_qty * 100.0 } else { 0.0 },
                                 pos.no_qty,
-                                if pos.no_qty > 0.0 { pos.no_cost / pos.no_qty * 100.0 } else { 0.0 }
+                                if pos.no_qty > 0.0 { pos.no_cost / pos.no_qty * 100.0 } else { 0.0 },
+                                unrealized
                             )
                         } else {
-                            String::new()
+                            format!("pos=0/{:.0}", max_contracts)
                         };
 
                         // Liquidity
@@ -644,269 +815,449 @@ async fn main() -> Result<()> {
                         let yes_mid = (yes_bid + yes_ask) as f64 / 2.0;
                         let implied_prob = format!("prob={:.0}%", yes_mid);
 
+                        // Show filter status or trading info
+                        let status_suffix = if let Some(ref reason) = filter_reason {
+                            format!("⏸ {}", reason)
+                        } else {
+                            format!("{} {}", pos_str, thresh_flag)
+                        };
+
                         println!(
-                            "{} {} {} spot={} | age={:.1}m left={:.1}m | Y {}/{}c (sp{}c) N {}/{}c (sp{}c) | sum={}c {} | {} | {} {} {}{}",
+                            "{} {} {} {} spot={} | age={:.1}m left={:.1}m | Y {}/{}c N {}/{}c | sum={}c {} | {} | {} | {}",
                             now,
                             price_status,
                             market.asset,
+                            market.pin_name(),
                             spot,
                             market_age,
                             expiry,
-                            yes_bid, yes_ask, yes_spread,
-                            no_bid, no_ask, no_spread,
+                            yes_bid, yes_ask,
+                            no_bid, no_ask,
                             combined,
                             arb_flag,
                             implied_prob,
                             liq_str,
-                            thresh_flag,
-                            if pos.bought_crash { "[BOUGHT]" } else { "" },
-                            pnl_str
+                            status_suffix
                         );
                     }
                 }
 
                 msg = read.next() => {
-                    let Some(msg) = msg else { break; };
+                    let Some(msg) = msg else {
+                        info!("[WS] Stream ended (no more messages)");
+                        break;
+                    };
 
                     match msg {
                         Ok(Message::Text(text)) => {
-                            if let Ok(books) = serde_json::from_str::<Vec<BookSnapshot>>(&text) {
-                                for book in books {
-                                    let mut s = state.write().await;
+                            trace!("[WS] Raw message: {}", &text[..text.len().min(300)]);
 
-                                    let market_id = s
-                                        .markets
-                                        .iter()
-                                        .find(|(_, m)| {
-                                            m.yes_token == book.asset_id || m.no_token == book.asset_id
-                                        })
-                                        .map(|(id, _)| id.clone());
+                            match serde_json::from_str::<Vec<BookSnapshot>>(&text) {
+                                Ok(books) => {
+                                    debug!("[WS] Parsed {} book snapshots", books.len());
 
-                                    let Some(market_id) = market_id else { continue };
+                                    for book in books {
+                                        let mut s = state.write().await;
 
-                                    let best_ask = book
-                                        .asks
-                                        .iter()
-                                        .filter_map(|l| {
-                                            let price = parse_price_cents(&l.price);
-                                            if price > 0 {
-                                                Some((price, parse_size(&l.size)))
+                                        let market_id = s
+                                            .markets
+                                            .iter()
+                                            .find(|(_, m)| {
+                                                m.yes_token == book.asset_id || m.no_token == book.asset_id
+                                            })
+                                            .map(|(id, _)| id.clone());
+
+                                        let Some(market_id) = market_id else {
+                                            debug!("[WS] Unknown asset_id: {}", &book.asset_id[..book.asset_id.len().min(16)]);
+                                            continue;
+                                        };
+
+                                        let best_ask = book
+                                            .asks
+                                            .iter()
+                                            .filter_map(|l| {
+                                                let price = parse_price_cents(&l.price);
+                                                if price > 0 {
+                                                    Some((price, parse_size(&l.size)))
+                                                } else {
+                                                    None
+                                                }
+                                            })
+                                            .min_by_key(|(p, _)| *p);
+
+                                        let best_bid = book
+                                            .bids
+                                            .iter()
+                                            .filter_map(|l| {
+                                                let price = parse_price_cents(&l.price);
+                                                if price > 0 {
+                                                    Some((price, parse_size(&l.size)))
+                                                } else {
+                                                    None
+                                                }
+                                            })
+                                            .max_by_key(|(p, _)| *p);
+
+                                        // Total liquidity across all ask levels
+                                        let total_ask_size: f64 = book
+                                            .asks
+                                            .iter()
+                                            .map(|l| parse_size(&l.size))
+                                            .sum();
+
+                                        // Total bid liquidity
+                                        let total_bid_size: f64 = book
+                                            .bids
+                                            .iter()
+                                            .map(|l| parse_size(&l.size))
+                                            .sum();
+
+                                        let Some(market) = s.markets.get_mut(&market_id) else {
+                                            debug!("[WS] Market {} not found in state", &market_id[..16]);
+                                            continue;
+                                        };
+
+                                        let is_yes = book.asset_id == market.yes_token;
+                                        let side = if is_yes { "YES" } else { "NO" };
+
+                                        // Track old values for change detection
+                                        let (old_ask, old_bid, old_size) = if is_yes {
+                                            (market.yes_ask, market.yes_bid, market.yes_ask_size)
+                                        } else {
+                                            (market.no_ask, market.no_bid, market.no_ask_size)
+                                        };
+
+                                        if is_yes {
+                                            market.yes_ask = best_ask.map(|(p, _)| p);
+                                            market.yes_bid = best_bid.map(|(p, _)| p);
+                                            market.yes_ask_size = total_ask_size;
+                                        } else {
+                                            market.no_ask = best_ask.map(|(p, _)| p);
+                                            market.no_bid = best_bid.map(|(p, _)| p);
+                                            market.no_ask_size = total_ask_size;
+                                        }
+
+                                        // Log orderbook changes
+                                        let new_ask = best_ask.map(|(p, _)| p);
+                                        let new_bid = best_bid.map(|(p, _)| p);
+                                        let ask_changed = old_ask != new_ask;
+                                        let bid_changed = old_bid != new_bid;
+                                        let size_changed = (old_size - total_ask_size).abs() > 0.01;
+
+                                        if ask_changed || bid_changed || size_changed {
+                                            debug!("[BOOK] {} {} | bid: {:?}c->{:?}c | ask: {:?}c->{:?}c | liq: {:.0}->{:.0} (bids={} asks={})",
+                                                   market.asset, side,
+                                                   old_bid, new_bid,
+                                                   old_ask, new_ask,
+                                                   old_size, total_ask_size,
+                                                   book.bids.len(), book.asks.len());
+                                        } else {
+                                            trace!("[BOOK] {} {} unchanged | bid={:?}c ask={:?}c liq={:.0}",
+                                                   market.asset, side, new_bid, new_ask, total_ask_size);
+                                        }
+
+                                        // Log full book depth at trace level
+                                        if !book.asks.is_empty() || !book.bids.is_empty() {
+                                            trace!("[BOOK] {} {} depth: {} bids (total={:.0}) / {} asks (total={:.0})",
+                                                   market.asset, side,
+                                                   book.bids.len(), total_bid_size,
+                                                   book.asks.len(), total_ask_size);
+                                        }
+
+                                        // Extract values
+                                        let asset = market.asset.clone();
+                                        let mins = market.minutes_remaining().unwrap_or(0.0);
+                                        let yes_ask_price = market.yes_ask;
+                                        let no_ask_price = market.no_ask;
+                                        let yes_token = market.yes_token.clone();
+                                        let no_token = market.no_token.clone();
+                                        let _question = market.question.clone();
+
+                                        // Get underlying price for this asset
+                                        let underlying_price = match asset.as_str() {
+                                            "BTC" => s.prices.btc_price,
+                                            "ETH" => s.prices.eth_price,
+                                            "SOL" => s.prices.sol_price,
+                                            "XRP" => s.prices.xrp_price,
+                                            _ => None,
+                                        };
+
+                                        let market_age = 15.0 - mins; // How many minutes into the market
+
+                                        // Log filtering decisions
+                                        if mins < min_minutes {
+                                            trace!("[FILTER] {} skipped: mins={:.1} < min_minutes={:.1}", asset, mins, min_minutes);
+                                            continue;
+                                        }
+                                        if mins > max_minutes {
+                                            trace!("[FILTER] {} skipped: mins={:.1} > max_minutes={:.1}", asset, mins, max_minutes);
+                                            continue;
+                                        }
+                                        if market_age > max_age {
+                                            trace!("[FILTER] {} skipped: age={:.1}m > max_age={:.1}m", asset, market_age, max_age);
+                                            continue;
+                                        }
+
+                                        let yes_ask = yes_ask_price.unwrap_or(100);
+                                        let no_ask = no_ask_price.unwrap_or(100);
+
+                                        let market_id_clone = market_id.clone();
+                                        drop(s);
+
+                                        // Format underlying price
+                                        let spot_str = underlying_price
+                                            .map(|p| format!("${:.2}", p))
+                                            .unwrap_or_else(|| "-".to_string());
+
+                                        // Check current position size
+                                        let current_position = {
+                                            let s = state.read().await;
+                                            s.positions.get(&market_id_clone)
+                                                .map(|p| p.yes_qty + p.no_qty)
+                                                .unwrap_or(0.0)
+                                        };
+
+                                        if current_position >= max_contracts {
+                                            debug!("[POSITION] {} max reached ({:.0}/{:.0}), skipping",
+                                                   asset, current_position, max_contracts);
+                                            continue;
+                                        }
+
+                                        let remaining = max_contracts - current_position;
+
+                                        // === STRATEGY 1: Buy on crash ===
+                                        // Buy YES if it drops to threshold threshold
+                                        if yes_ask <= threshold && yes_ask > 0 {
+                                            info!("[SIGNAL] {} YES @{}c <= threshold {}c | age={:.1}m spot={} | pos={:.0}/{:.0}",
+                                                  asset, yes_ask, threshold, market_age, spot_str, current_position, max_contracts);
+
+                                            // Add 2c to cross the spread and ensure FAK fills
+                                            let cross_price = (yes_ask + 2).min(99) as f64 / 100.0;
+                                            // Polymarket requires minimum $1 order value - scale up contracts if needed
+                                            let min_contracts = (1.0 / cross_price).ceil();
+                                            let actual_contracts = contracts.max(min_contracts).min(remaining);
+                                            let cost = actual_contracts * cross_price;
+
+                                            if actual_contracts < min_contracts {
+                                                debug!("[POSITION] {} can't meet min order ({:.0} < {:.0}), skipping",
+                                                       asset, actual_contracts, min_contracts);
+                                            } else if dry_run {
+                                                warn!("[DRY] {} YES @{}c | Would BUY {:.0} @{}c (${:.2}) | REASON: crash buy - YES dropped to threshold {}c",
+                                                      asset, yes_ask, actual_contracts, yes_ask + 2, cost, threshold);
                                             } else {
-                                                None
-                                            }
-                                        })
-                                        .min_by_key(|(p, _)| *p);
+                                                warn!("[TRADE] BUY {:.0} {} YES @{}c (${:.2}) | REASON: crash buy - YES dropped to threshold {}c",
+                                                      actual_contracts, asset, yes_ask + 2, cost, threshold);
 
-                                    let best_bid = book
-                                        .bids
-                                        .iter()
-                                        .filter_map(|l| {
-                                            let price = parse_price_cents(&l.price);
-                                            if price > 0 {
-                                                Some((price, parse_size(&l.size)))
+                                                let client = shared_client.clone();
+                                                let state_clone = state.clone();
+                                                let yes_token_clone = yes_token.clone();
+                                                let market_id_for_spawn = market_id_clone.clone();
+                                                let asset_clone = asset.clone();
+
+                                                // Execute trade asynchronously
+                                                tokio::spawn(async move {
+                                                    match client.buy_fak(&yes_token_clone, cross_price, actual_contracts).await {
+                                                        Ok(fill) if fill.filled_size > 0.0 => {
+                                                            warn!("[TRADE] {} YES FILLED {:.1} @${:.2}",
+                                                                  asset_clone, fill.filled_size, fill.fill_cost);
+
+                                                            let mut s = state_clone.write().await;
+                                                            if let Some(pos) = s.positions.get_mut(&market_id_for_spawn) {
+                                                                pos.yes_qty += fill.filled_size;
+                                                                pos.yes_cost += fill.fill_cost;
+                                                                pos.bought_crash = true;
+                                                            }
+                                                        }
+                                                        Ok(_) => {
+                                                            debug!("[TRADE] {} YES no fill (FAK killed)", asset_clone);
+                                                        }
+                                                        Err(e) => {
+                                                            error!("[TRADE] {} YES order error: {}", asset_clone, e);
+                                                        }
+                                                    }
+                                                });
+                                            }
+                                        } else if yes_ask <= threshold + 10 && yes_ask > 0 {
+                                            // Log near-threshold
+                                            debug!("[WATCH] {} YES @{}c approaching threshold {}c ({}c away)",
+                                                   asset, yes_ask, threshold, yes_ask - threshold);
+                                        }
+
+                                        // Buy NO if it drops to threshold
+                                        if no_ask <= threshold && no_ask > 0 {
+                                            info!("[SIGNAL] {} NO @{}c <= threshold {}c | age={:.1}m spot={} | pos={:.0}/{:.0}",
+                                                  asset, no_ask, threshold, market_age, spot_str, current_position, max_contracts);
+
+                                            // Add 2c to cross the spread and ensure FAK fills
+                                            let cross_price = (no_ask + 2).min(99) as f64 / 100.0;
+                                            // Polymarket requires minimum $1 order value - scale up contracts if needed
+                                            let min_contracts = (1.0 / cross_price).ceil();
+                                            let actual_contracts = contracts.max(min_contracts).min(remaining);
+                                            let cost = actual_contracts * cross_price;
+
+                                            if actual_contracts < min_contracts {
+                                                debug!("[POSITION] {} can't meet min order ({:.0} < {:.0}), skipping",
+                                                       asset, actual_contracts, min_contracts);
+                                            } else if dry_run {
+                                                warn!("[DRY] {} NO @{}c | Would BUY {:.0} @{}c (${:.2}) | REASON: crash buy - NO dropped to threshold {}c",
+                                                      asset, no_ask, actual_contracts, no_ask + 2, cost, threshold);
                                             } else {
-                                                None
+                                                warn!("[TRADE] BUY {:.0} {} NO @{}c (${:.2}) | REASON: crash buy - NO dropped to threshold {}c",
+                                                      actual_contracts, asset, no_ask + 2, cost, threshold);
+
+                                                let client = shared_client.clone();
+                                                let state_clone = state.clone();
+                                                let no_token_clone = no_token.clone();
+                                                let market_id_for_spawn = market_id_clone.clone();
+                                                let asset_clone = asset.clone();
+
+                                                // Execute trade asynchronously
+                                                tokio::spawn(async move {
+                                                    match client.buy_fak(&no_token_clone, cross_price, actual_contracts).await {
+                                                        Ok(fill) if fill.filled_size > 0.0 => {
+                                                            warn!("[TRADE] {} NO FILLED {:.1} @${:.2}",
+                                                                  asset_clone, fill.filled_size, fill.fill_cost);
+
+                                                            let mut s = state_clone.write().await;
+                                                            if let Some(pos) = s.positions.get_mut(&market_id_for_spawn) {
+                                                                pos.no_qty += fill.filled_size;
+                                                                pos.no_cost += fill.fill_cost;
+                                                                pos.bought_crash = true;
+                                                            }
+                                                        }
+                                                        Ok(_) => {
+                                                            debug!("[TRADE] {} NO no fill (FAK killed)", asset_clone);
+                                                        }
+                                                        Err(e) => {
+                                                            error!("[TRADE] {} NO order error: {}", asset_clone, e);
+                                                        }
+                                                    }
+                                                });
                                             }
-                                        })
-                                        .max_by_key(|(p, _)| *p);
+                                        } else if no_ask <= threshold + 10 && no_ask > 0 {
+                                            debug!("[WATCH] {} NO @{}c approaching threshold {}c ({}c away)",
+                                                   asset, no_ask, threshold, no_ask - threshold);
+                                        }
 
-                                    // Total liquidity across all ask levels
-                                    let total_ask_size: f64 = book
-                                        .asks
-                                        .iter()
-                                        .map(|l| parse_size(&l.size))
-                                        .sum();
+                                        // === STRATEGY 2: Arb when both sides cheap ===
+                                        // If YES + NO <= max_arb_cost, buy both for guaranteed profit
+                                        let combined = yes_ask + no_ask;
+                                        if combined <= max_arb_cost && yes_ask > 0 && no_ask > 0 {
+                                            let profit = 100 - combined;
+                                            info!("[SIGNAL] {} ARB opportunity: Y={}c + N={}c = {}c | profit={}c | pos={:.0}/{:.0}",
+                                                  asset, yes_ask, no_ask, combined, profit, current_position, max_contracts);
 
-                                    let Some(market) = s.markets.get_mut(&market_id) else {
-                                        continue;
-                                    };
+                                            // Add 2c to cross spreads
+                                            let yes_cross = (yes_ask + 2).min(99) as f64 / 100.0;
+                                            let no_cross = (no_ask + 2).min(99) as f64 / 100.0;
+                                            let min_contracts = (1.0 / yes_cross.min(no_cross)).ceil();
+                                            // For arb, we buy both sides so need 2x remaining
+                                            let actual_contracts = contracts.max(min_contracts).min(remaining / 2.0);
 
-                                    let is_yes = book.asset_id == market.yes_token;
+                                            if actual_contracts < min_contracts {
+                                                debug!("[POSITION] {} ARB can't meet min order ({:.0} < {:.0}), skipping",
+                                                       asset, actual_contracts, min_contracts);
+                                            } else if dry_run {
+                                                warn!("[DRY] {} ARB Y={}c + N={}c | {:.0} contracts | profit ${:.2} | REASON: arb - combined cost {}c <= max {}c",
+                                                      asset, yes_ask + 2, no_ask + 2, actual_contracts,
+                                                      actual_contracts * profit as f64 / 100.0, combined, max_arb_cost);
+                                            } else {
+                                                warn!("[TRADE] ARB BUY {:.0} {} YES @{}c + NO @{}c | profit={}c | REASON: arb - combined cost {}c <= max {}c",
+                                                      actual_contracts, asset, yes_ask + 2, no_ask + 2, profit, combined, max_arb_cost);
 
-                                    if is_yes {
-                                        market.yes_ask = best_ask.map(|(p, _)| p);
-                                        market.yes_bid = best_bid.map(|(p, _)| p);
-                                        market.yes_ask_size = total_ask_size;
+                                                // Buy YES
+                                                let client = shared_client.clone();
+                                                let state_clone = state.clone();
+                                                let yes_token_clone = yes_token.clone();
+                                                let market_id_for_spawn = market_id_clone.clone();
+                                                let asset_clone = asset.clone();
+
+                                                tokio::spawn(async move {
+                                                    match client.buy_fak(&yes_token_clone, yes_cross, actual_contracts).await {
+                                                        Ok(fill) if fill.filled_size > 0.0 => {
+                                                            warn!("[TRADE] {} ARB YES FILLED {:.1} @${:.2}",
+                                                                  asset_clone, fill.filled_size, fill.fill_cost);
+
+                                                            let mut s = state_clone.write().await;
+                                                            if let Some(pos) = s.positions.get_mut(&market_id_for_spawn) {
+                                                                pos.yes_qty += fill.filled_size;
+                                                                pos.yes_cost += fill.fill_cost;
+                                                            }
+                                                        }
+                                                        Ok(_) => {
+                                                            debug!("[TRADE] {} ARB YES no fill", asset_clone);
+                                                        }
+                                                        Err(e) => {
+                                                            error!("[TRADE] {} ARB YES error: {}", asset_clone, e);
+                                                        }
+                                                    }
+                                                });
+
+                                                // Buy NO
+                                                let client = shared_client.clone();
+                                                let state_clone = state.clone();
+                                                let no_token_clone = no_token.clone();
+                                                let market_id_for_spawn = market_id_clone.clone();
+                                                let asset_clone = asset.clone();
+
+                                                tokio::spawn(async move {
+                                                    match client.buy_fak(&no_token_clone, no_cross, actual_contracts).await {
+                                                        Ok(fill) if fill.filled_size > 0.0 => {
+                                                            warn!("[TRADE] {} ARB NO FILLED {:.1} @${:.2}",
+                                                                  asset_clone, fill.filled_size, fill.fill_cost);
+
+                                                            let mut s = state_clone.write().await;
+                                                            if let Some(pos) = s.positions.get_mut(&market_id_for_spawn) {
+                                                                pos.no_qty += fill.filled_size;
+                                                                pos.no_cost += fill.fill_cost;
+                                                            }
+                                                        }
+                                                        Ok(_) => {
+                                                            debug!("[TRADE] {} ARB NO no fill", asset_clone);
+                                                        }
+                                                        Err(e) => {
+                                                            error!("[TRADE] {} ARB NO error: {}", asset_clone, e);
+                                                        }
+                                                    }
+                                                });
+                                            }
+                                        } else if combined <= max_arb_cost + 5 && yes_ask > 0 && no_ask > 0 {
+                                            debug!("[WATCH] {} near arb: Y={}c + N={}c = {}c (need <= {}c)",
+                                                   asset, yes_ask, no_ask, combined, max_arb_cost);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    // Check if it's a different message type
+                                    if text.contains("\"type\"") {
+                                        debug!("[WS] Non-book message: {}", &text[..text.len().min(100)]);
                                     } else {
-                                        market.no_ask = best_ask.map(|(p, _)| p);
-                                        market.no_bid = best_bid.map(|(p, _)| p);
-                                        market.no_ask_size = total_ask_size;
-                                    }
-
-                                    // Extract values
-                                    let asset = market.asset.clone();
-                                    let mins = market.minutes_remaining().unwrap_or(0.0);
-                                    let yes_ask_price = market.yes_ask;
-                                    let no_ask_price = market.no_ask;
-                                    let yes_token = market.yes_token.clone();
-                                    let no_token = market.no_token.clone();
-                                    let _question = market.question.clone();
-
-                                    // Get underlying price for this asset
-                                    let underlying_price = match asset.as_str() {
-                                        "BTC" => s.prices.btc_price,
-                                        "ETH" => s.prices.eth_price,
-                                        "SOL" => s.prices.sol_price,
-                                        "XRP" => s.prices.xrp_price,
-                                        _ => None,
-                                    };
-
-                                    let market_age = 15.0 - mins; // How many minutes into the market
-                                    if mins < min_minutes || mins > max_minutes {
-                                        continue;
-                                    }
-                                    if market_age > max_age {
-                                        continue; // Market too old, skip trading
-                                    }
-
-                                    let yes_ask = yes_ask_price.unwrap_or(100);
-                                    let no_ask = no_ask_price.unwrap_or(100);
-
-                                    // Get position
-                                    let pos = s.positions.get(&market_id).cloned().unwrap_or_default();
-                                    let market_id_clone = market_id.clone();
-                                    drop(s);
-
-                                    // Format underlying price
-                                    let spot_str = underlying_price
-                                        .map(|p| format!("${:.2}", p))
-                                        .unwrap_or_else(|| "-".to_string());
-                                    let now = Utc::now().format("%H:%M:%S");
-
-                                    // === STRATEGY 1: Buy on crash ===
-                                    // Buy YES if it drops to threshold threshold
-                                    if yes_ask <= threshold && yes_ask > 0 {
-                                        if dry_run {
-                                            info!("[DRY] {} {} YES @{}c <= {}c | age={:.0}m spot={} | Would BUY {:.0} contracts",
-                                                  now, asset, yes_ask, threshold, market_age, spot_str, contracts);
-                                        } else {
-                                            let price = yes_ask as f64 / 100.0;
-
-                                            warn!(
-                                                "[TRADE] BUY {:.0} YES @{}c | {}",
-                                                contracts, yes_ask, asset
-                                            );
-
-                                            match shared_client.buy_fak(&yes_token, price, contracts).await {
-                                                Ok(fill) => {
-                                                    if fill.filled_size > 0.0 {
-                                                        warn!(
-                                                            "[TRADE] Filled {:.2} @${:.2}",
-                                                            fill.filled_size, fill.fill_cost
-                                                        );
-                                                        let mut s = state.write().await;
-                                                        if let Some(pos) = s.positions.get_mut(&market_id_clone) {
-                                                            pos.yes_qty += fill.filled_size;
-                                                            pos.yes_cost += fill.fill_cost;
-                                                            pos.bought_crash = true;
-                                                        }
-                                                    }
-                                                }
-                                                Err(e) => error!("[TRADE] YES buy failed: {}", e),
-                                            }
-                                        }
-                                    }
-
-                                    // Buy NO if it drops to threshold
-                                    if no_ask <= threshold && no_ask > 0 {
-                                        if dry_run {
-                                            info!("[DRY] {} {} NO @{}c <= {}c | age={:.0}m spot={} | Would BUY {:.0} contracts",
-                                                  now, asset, no_ask, threshold, market_age, spot_str, contracts);
-                                        } else {
-                                            let price = no_ask as f64 / 100.0;
-
-                                            warn!(
-                                                "[TRADE] BUY {:.0} NO @{}c | {}",
-                                                contracts, no_ask, asset
-                                            );
-
-                                            match shared_client.buy_fak(&no_token, price, contracts).await {
-                                                Ok(fill) => {
-                                                    if fill.filled_size > 0.0 {
-                                                        warn!(
-                                                            "[TRADE] Filled {:.2} @${:.2}",
-                                                            fill.filled_size, fill.fill_cost
-                                                        );
-                                                        let mut s = state.write().await;
-                                                        if let Some(pos) = s.positions.get_mut(&market_id_clone) {
-                                                            pos.no_qty += fill.filled_size;
-                                                            pos.no_cost += fill.fill_cost;
-                                                            pos.bought_crash = true;
-                                                        }
-                                                    }
-                                                }
-                                                Err(e) => error!("[TRADE] NO buy failed: {}", e),
-                                            }
-                                        }
-                                    }
-
-                                    // === STRATEGY 2: Arb when both sides cheap ===
-                                    // If YES + NO <= max_arb_cost, buy both for guaranteed profit
-                                    let combined = yes_ask + no_ask;
-                                    if combined <= max_arb_cost && yes_ask > 0 && no_ask > 0 {
-                                        let profit = 100 - combined;
-
-                                        if dry_run {
-                                            info!("[DRY] {} {} ARB Y={}c + N={}c = {}c | age={:.0}m spot={} | {:.0} contracts | profit {}c",
-                                                  now, asset, yes_ask, no_ask, combined, market_age, spot_str, contracts, profit);
-                                        } else {
-                                            // Buy both sides
-                                            let yes_price = yes_ask as f64 / 100.0;
-                                            let no_price = no_ask as f64 / 100.0;
-
-                                            warn!(
-                                                "[TRADE] ARB BUY {:.0} YES @{}c + NO @{}c | profit {}c",
-                                                contracts, yes_ask, no_ask, profit
-                                            );
-
-                                            // Buy YES
-                                            match shared_client.buy_fak(&yes_token, yes_price, contracts).await
-                                            {
-                                                Ok(fill) => {
-                                                    if fill.filled_size > 0.0 {
-                                                        warn!(
-                                                            "[TRADE] YES Filled {:.2} @${:.2}",
-                                                            fill.filled_size, fill.fill_cost
-                                                        );
-                                                        let mut s = state.write().await;
-                                                        if let Some(pos) = s.positions.get_mut(&market_id_clone)
-                                                        {
-                                                            pos.yes_qty += fill.filled_size;
-                                                            pos.yes_cost += fill.fill_cost;
-                                                        }
-                                                    }
-                                                }
-                                                Err(e) => error!("[TRADE] YES arb buy failed: {}", e),
-                                            }
-
-                                            // Buy NO
-                                            match shared_client.buy_fak(&no_token, no_price, contracts).await {
-                                                Ok(fill) => {
-                                                    if fill.filled_size > 0.0 {
-                                                        warn!(
-                                                            "[TRADE] NO Filled {:.2} @${:.2}",
-                                                            fill.filled_size, fill.fill_cost
-                                                        );
-                                                        let mut s = state.write().await;
-                                                        if let Some(pos) = s.positions.get_mut(&market_id_clone)
-                                                        {
-                                                            pos.no_qty += fill.filled_size;
-                                                            pos.no_cost += fill.fill_cost;
-                                                        }
-                                                    }
-                                                }
-                                                Err(e) => error!("[TRADE] NO arb buy failed: {}", e),
-                                            }
-                                        }
+                                        trace!("[WS] Parse error: {} - msg: {}", e, &text[..text.len().min(100)]);
                                     }
                                 }
                             }
                         }
                         Ok(Message::Ping(data)) => {
+                            trace!("[WS] Received ping, sending pong");
                             let _ = write.send(Message::Pong(data)).await;
                         }
-                        Ok(Message::Close(_)) | Err(_) => break,
-                        _ => {}
+                        Ok(Message::Pong(_)) => {
+                            trace!("[WS] Received pong");
+                        }
+                        Ok(Message::Binary(data)) => {
+                            debug!("[WS] Received binary: {} bytes", data.len());
+                        }
+                        Ok(Message::Close(frame)) => {
+                            warn!("[WS] Received close frame: {:?}", frame);
+                            break;
+                        }
+                        Ok(Message::Frame(_)) => {
+                            trace!("[WS] Received raw frame");
+                        }
+                        Err(e) => {
+                            error!("[WS] WebSocket error: {}", e);
+                            break;
+                        }
                     }
                 }
             }
