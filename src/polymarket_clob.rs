@@ -643,7 +643,7 @@ impl SharedAsyncClient {
 
         tracing::info!("[POLY] Order: maker={} taker={} side={} price={:.2} neg_risk={}",
             signed.order.maker_amount, signed.order.taker_amount, signed.order.side, price, neg_risk);
-        tracing::info!("[POLY] Full body: {}", body);
+        tracing::info!("[POLY] Full body: {} signed.orer.price {}", body, signed.order.side);
 
         // Post order
         let resp = self.inner.post_order_async(body, &self.creds).await?;
