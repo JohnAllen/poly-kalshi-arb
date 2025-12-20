@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use arb_bot::polymarket_clob::{PolymarketAsyncClient, SharedAsyncClient, PreparedCreds};
 use arb_bot::polymarket_markets::{discover_markets, PolyMarket};
@@ -56,9 +56,9 @@ struct Args {
     #[arg(short, long, default_value_t = false)]
     direct: bool,
 
-    /// Max total contracts to hold (default: 10)
-    #[arg(short, long, default_value_t = 10.0)]
-    max_contracts: f64,
+    /// Max total dollars to invest (default: $1)
+    #[arg(short, long, default_value_t = 1.0)]
+    max_dollars: f64,
 
     /// Take profit threshold in cents (sell when bid >= entry + this)
     #[arg(long, default_value_t = 5)]
@@ -92,8 +92,8 @@ impl PriceTracker {
 #[derive(Debug, Clone)]
 struct Market {
     // Core market data from PolyMarket
-    condition_id: String,
-    question: String,
+    _condition_id: String,
+    _question: String,
     yes_token: String,
     no_token: String,
     asset: String,
@@ -114,8 +114,8 @@ struct Market {
 impl Market {
     fn from_polymarket(pm: PolyMarket) -> Self {
         Self {
-            condition_id: pm.condition_id,
-            question: pm.question,
+            _condition_id: pm.condition_id,
+            _question: pm.question,
             yes_token: pm.yes_token,
             no_token: pm.no_token,
             asset: pm.asset,
@@ -180,7 +180,8 @@ struct OpenPosition {
     side: &'static str, // "YES" or "NO"
     entry_price: i64,   // cents
     size: f64,
-    opened_at: Instant,
+    _opened_at: Instant,
+    sell_pending: bool, // Track if a sell order is already in-flight
 }
 
 #[derive(Debug, Clone)]
@@ -213,8 +214,10 @@ impl State {
         }
     }
 
-    fn total_position_size(&self) -> f64 {
-        self.open_positions.iter().map(|p| p.size).sum()
+    fn total_invested(&self) -> f64 {
+        self.open_positions.iter()
+            .map(|p| p.size * p.entry_price as f64 / 100.0)
+            .sum()
     }
 
     fn add_position(&mut self, asset: String, token_id: String, side: &'static str, entry_price: i64, size: f64) {
@@ -224,7 +227,7 @@ impl State {
             side,
             entry_price,
             size,
-            opened_at: Instant::now(),
+            _opened_at: Instant::now(),
         });
     }
 
@@ -242,6 +245,7 @@ struct PriceFeedMessage {
     eth_price: Option<f64>,
     sol_price: Option<f64>,
     xrp_price: Option<f64>,
+    #[allow(dead_code)]
     timestamp: Option<u64>,
 }
 
@@ -611,6 +615,7 @@ struct BookSnapshot {
 #[derive(Deserialize, Debug)]
 struct PriceLevel {
     price: String,
+    #[allow(dead_code)]
     size: String,
 }
 
@@ -659,8 +664,8 @@ async fn main() -> Result<()> {
 
     let mode = if args.live { "LIVE" } else { "DRY" };
     let sym_str = args.sym.as_deref().unwrap_or("ALL");
-    info!("[poly_momentum] {} | {} | {}bps threshold | max {} | TP {}¢",
-          mode, sym_str, args.threshold_bps, args.max_contracts, args.take_profit);
+    info!("[poly_momentum] {} | {} | {}bps threshold | max ${} | TP {}¢",
+          mode, sym_str, args.threshold_bps, args.max_dollars, args.take_profit);
 
     // Load credentials from project root .env
     let project_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -767,10 +772,10 @@ async fn main() -> Result<()> {
             .collect()
     };
 
-    let contracts = args.contracts;
+    let _contracts = args.contracts;
     let dry_run = !args.live;
     let status_symbol = args.sym;
-    let max_contracts = args.max_contracts;
+    let max_dollars = args.max_dollars;
     let take_profit = args.take_profit;
 
     // Main WebSocket loop
@@ -877,8 +882,10 @@ async fn main() -> Result<()> {
                     // Process pending momentum signals
                     let mut s = state.write().await;
 
-                    // Check for profit-taking opportunities
-                    if !dry_run {
+                    // Check for profit-taking opportunities (both live and paper)
+                    if !s.open_positions.is_empty() {
+                        let mode_tag = if dry_run { "[DRY]" } else { "[LIVE]" };
+                        info!("[poly_momentum] {} Tracking {} positions", mode_tag, s.open_positions.len());
                         // (token_id, asset, bid, size, entry_price)
                         let positions_to_close: Vec<(String, String, i64, f64, i64)> = s.open_positions.iter()
                             .filter_map(|pos| {
@@ -901,32 +908,37 @@ async fn main() -> Result<()> {
                             .collect();
 
                         for (token_id, asset, bid, size, entry) in positions_to_close {
-                            let client = shared_client.clone();
-                            let state_clone = state.clone();
-                            let token_clone = token_id.clone();
-
                             let cost = size * entry as f64 / 100.0;
                             let revenue = size * bid as f64 / 100.0;
                             let profit = revenue - cost;
-                            info!("[poly_momentum] 💰 SELL {:.1} {} @{}¢ (cost=${:.2} rev=${:.2} +${:.2})",
-                                  size, asset, bid, cost, revenue, profit);
 
-                            tokio::spawn(async move {
-                                // Sell 1¢ below bid to ensure fill
-                                let sell_price = (bid - 1).max(1) as f64 / 100.0;
-                                info!("sell price: {}", sell_price);
-                                match client.sell_fak(&token_clone, sell_price, size).await {
-                                    Ok(fill) if fill.filled_size > 0.0 => {
-                                        info!("[poly_momentum] ✅ Sold {:.1} @${:.2}", fill.filled_size, fill.fill_cost);
-                                        let mut s = state_clone.write().await;
-                                        s.remove_position(&token_clone);
+                            if dry_run {
+                                info!("[poly_momentum] [DRY] 💰 Would SELL {:.1} {} @{}¢ (cost=${:.2} rev=${:.2} P&L=${:+.2})",
+                                      size, asset, bid, cost, revenue, profit);
+                                s.remove_position(&token_id);
+                            } else {
+                                let client = shared_client.clone();
+                                let state_clone = state.clone();
+                                let token_clone = token_id.clone();
+
+                                info!("[poly_momentum] [LIVE] 💰 SELL {:.1} {} @{}¢ (cost=${:.2} rev=${:.2} P&L=${:+.2})",
+                                      size, asset, bid, cost, revenue, profit);
+
+                                tokio::spawn(async move {
+                                    let sell_price = (bid - 1).max(1) as f64 / 100.0;
+                                    match client.sell_fak(&token_clone, sell_price, size).await {
+                                        Ok(fill) if fill.filled_size > 0.0 => {
+                                            info!("[poly_momentum] [LIVE] ✅ Sold {:.1} @${:.2}", fill.filled_size, fill.fill_cost);
+                                            let mut s = state_clone.write().await;
+                                            s.remove_position(&token_clone);
+                                        }
+                                        Ok(_) => {}
+                                        Err(e) => {
+                                            error!("[poly_momentum] ❌ Sell error: {}", e);
+                                        }
                                     }
-                                    Ok(_) => {}
-                                    Err(e) => {
-                                        error!("[poly_momentum] ❌ Sell error: {}", e);
-                                    }
-                                }
-                            });
+                                });
+                            }
                         }
                     }
 
@@ -936,30 +948,32 @@ async fn main() -> Result<()> {
                     // Process signals
                     let signals: Vec<MomentumSignal> = s.pending_signals.drain(..).collect();
 
-                    // Get position size before signal loop (to avoid borrow conflicts)
-                    let current_position = s.total_position_size();
+                    // Get total dollars invested before signal loop
+                    let current_invested = s.total_invested();
 
                     for signal in signals {
-                        // Check max contracts limit first
-                        if current_position >= max_contracts {
-                            tracing::debug!("[poly_momentum] Max position reached ({:.0}/{:.0})", current_position, max_contracts);
+                        // Check max dollars limit first
+                        if current_invested >= max_dollars {
+                            info!("[poly_momentum] ⏭️ Max invested (${:.2}/${:.0})", current_invested, max_dollars);
                             continue;
                         }
 
-                        // Get current price first (before mutable borrow)
-                        let current_price = s.price_trackers.get(&signal.asset)
-                            .and_then(|t| t.last_price);
+                        // Verify we have a current price for this asset
+                        let has_price = s.price_trackers.get(&signal.asset)
+                            .and_then(|t| t.last_price)
+                            .is_some();
 
-                        let Some(current_price) = current_price else {
-                            tracing::debug!("[poly_momentum] {} - no current price", signal.asset);
+                        if !has_price {
+                            info!("[poly_momentum] {} - no current price yet", signal.asset);
                             continue;
-                        };
+                        }
 
                         // Find market for this asset
                         let market_entry = s.markets.iter_mut()
                             .find(|(_, m)| m.asset == signal.asset);
 
                         let Some((market_id, market)) = market_entry else {
+                            info!("[poly_momentum] {} - no market found", signal.asset);
                             continue;
                         };
 
@@ -976,44 +990,55 @@ async fn main() -> Result<()> {
                         };
 
                         let Some(ask) = ask_price else {
-                            tracing::debug!("[poly_momentum] {} {} - no ask price", signal.asset, buy_side);
+                            info!("[poly_momentum] {} {} - no ask price in orderbook", signal.asset, buy_side);
                             continue;
                         };
 
-                        // Front-running strategy: just trade on momentum, no fair value calc
-                        // We're betting the market hasn't priced in the move yet
+                        // Only trade when price is in 10-90¢ range (avoid extremes)
+                        if ask < 10 || ask > 90 {
+                            info!("[poly_momentum] {} {} skip: {}¢ outside 10-90¢ range", signal.asset, buy_side, ask);
+                            continue;
+                        }
 
-                        // Calculate remaining capacity
-                        let remaining = max_contracts - current_position;
+                        // Calculate remaining dollar capacity
+                        let remaining_dollars = max_dollars - current_invested;
+
+                        // Log signal conditions
+                        let strike_str = market.strike_price.map(|s| format!("${:.0}", s)).unwrap_or("?".into());
+                        let time_left = market.time_remaining_mins().map(|t| format!("{:.0}m", t)).unwrap_or("?".into());
+                        let mode_str = if dry_run { "[DRY]" } else { "[LIVE]" };
+                        info!("[poly_momentum] {} Signal: {} {:?} {}bps | strike={} exp={} | {}={}¢ | max=${:.0}",
+                              mode_str, signal.asset, signal.direction, signal.move_bps,
+                              strike_str, time_left, buy_side, ask, max_dollars);
 
                         let market_id_clone = market_id.clone();
                         let buy_token_clone = buy_token.clone();
                         let asset_clone = signal.asset.clone();
-                        let entry_price = ask + 2; // crossing price in cents
 
-                        // Add 2¢ to cross the spread and ensure FAK fills
-                        let cross_price = entry_price.min(99) as f64 / 100.0;
+                        // Cross spread by +2¢, cap at 99¢
+                        let entry_price = (ask + 2).min(99);
+                        let cross_price = entry_price as f64 / 100.0;
 
                         // Polymarket requires minimum $1 order value for marketable orders
-                        let min_contracts = (1.0 / cross_price).ceil();
-
-                        // If we don't have enough capacity for $1 minimum, skip silently
-                        if remaining < min_contracts {
-                            debug!("[poly_momentum] Skip {} {}: need {} contracts for $1 min, only {:.0} capacity",
-                                   signal.asset, buy_side, min_contracts as i64, remaining);
+                        if remaining_dollars < 1.0 {
+                            info!("[poly_momentum] ⏭️ Skip: only ${:.2} remaining, need $1 min order",
+                                  remaining_dollars);
                             continue;
                         }
 
-                        // Use minimum contracts needed to meet $1 threshold
-                        let actual_contracts = min_contracts.min(remaining);
+                        // Calculate contracts: use remaining dollars, but at least $1 worth
+                        let dollars_to_spend = remaining_dollars.max(1.0);
+                        let max_contracts = (dollars_to_spend / cross_price).floor();
+                        let min_contracts = (1.0 / cross_price).ceil();
+                        let actual_contracts = max_contracts.max(min_contracts);
                         let cost = actual_contracts * cross_price;
 
                         if dry_run {
-                            info!("[poly_momentum] 🎯 Would BUY {:.0} {} {} @{}¢ (${:.2}) | {}bps",
-                                  actual_contracts, signal.asset, buy_side, entry_price, cost, signal.move_bps);
                             market.last_trade_time = Some(Instant::now());
+                            info!("[poly_momentum] [DRY] 🎯 Would BUY {:.0} {} {} @{}¢ (${:.2}) | {}bps",
+                                  actual_contracts, asset_clone, buy_side, entry_price, cost, signal.move_bps);
                         } else {
-                            info!("[poly_momentum] 🎯 BUY {:.0} {} {} @{}¢ (${:.2}) | {}bps",
+                            info!("[poly_momentum] [LIVE] 🎯 BUY {:.0} {} {} @{}¢ (${:.2}) | {}bps",
                                   actual_contracts, signal.asset, buy_side, entry_price, cost, signal.move_bps);
 
                             let client = shared_client.clone();

@@ -43,13 +43,9 @@ struct Args {
     #[arg(long, default_value_t = 97)]
     max_arb_cost: i64,
 
-    /// Number of contracts to buy per trade
-    #[arg(short, long, default_value_t = 1.0)]
-    contracts: f64,
-
-    /// Maximum total contracts to hold (default: 10)
+    /// Max total dollars to invest (default: $10)
     #[arg(short = 'm', long, default_value_t = 10.0)]
-    max_contracts: f64,
+    max_dollars: f64,
 
     /// Live trading mode (default is dry run)
     #[arg(short, long, default_value_t = false)]
@@ -566,6 +562,11 @@ async fn main() -> Result<()> {
                 .add_directive("poly_ping_pong=info".parse().unwrap())
                 .add_directive("arb_bot=info".parse().unwrap()),
         )
+        .with_target(false)
+        .with_level(false)
+        .with_timer(tracing_subscriber::fmt::time::LocalTime::new(
+            time::macros::format_description!("[hour]:[minute]:[second]")
+        ))
         .init();
 
     let args = Args::parse();
@@ -573,11 +574,10 @@ async fn main() -> Result<()> {
     println!("═══════════════════════════════════════════════════════════════════════");
     println!("POLYMARKET PING PONG BOT");
     println!("═══════════════════════════════════════════════════════════════════════");
-    println!("Symbol: {}  |  Mode: {}  |  Contracts: {:.0}  |  Max: {:.0}",
+    println!("Symbol: {}  |  Mode: {}  |  Max: ${:.0}",
              args.sym.to_uppercase(),
              if args.live { "LIVE" } else { "DRY RUN" },
-             args.contracts,
-             args.max_contracts);
+             args.max_dollars);
     println!("Threshold: {}c / {}c  |  Max arb: {}c  |  Time: {}m-{}m  |  Max age: {:.0}m",
              args.threshold, 100 - args.threshold, args.max_arb_cost,
              args.min_minutes, args.max_minutes, args.max_age);
@@ -640,8 +640,7 @@ async fn main() -> Result<()> {
 
     let threshold = args.threshold;
     let max_arb_cost = args.max_arb_cost;
-    let contracts = args.contracts;
-    let max_contracts = args.max_contracts;
+    let max_dollars = args.max_dollars;
     let dry_run = !args.live;
     let min_minutes = args.min_minutes as f64;
     let max_minutes = args.max_minutes as f64;
@@ -839,63 +838,57 @@ async fn main() -> Result<()> {
                             format!("gap={}c", combined - 100)
                         };
 
-                        // Distance from threshold
-                        let yes_to_thresh = yes_ask - threshold;
-                        let no_to_thresh = no_ask - threshold;
-                        let thresh_flag = if yes_to_thresh <= 5 || no_to_thresh <= 5 {
-                            format!("NEAR(Y{}c N{}c)", yes_to_thresh, no_to_thresh)
+                        // Distance from threshold (use bid to show where market actually IS)
+                        // Skip NEAR when no real orderbook (bid=0)
+                        let near_flag = if yes_bid > 0 && no_bid > 0 {
+                            let yes_bid_to_thresh = yes_bid as i64 - threshold;
+                            let no_bid_to_thresh = no_bid as i64 - threshold;
+                            if yes_bid_to_thresh <= 5 || no_bid_to_thresh <= 5 {
+                                format!(" NEAR(Y{}c N{}c)", yes_bid_to_thresh, no_bid_to_thresh)
+                            } else {
+                                String::new()
+                            }
                         } else {
                             String::new()
                         };
 
-                        // Position display
-                        let total_pos = pos.yes_qty + pos.no_qty;
-                        let pos_str = if total_pos > 0.0 {
+                        // Position display - use dollars
+                        let current_invested = pos.total_cost();
+                        let pos_str = if current_invested > 0.0 {
                             let matched = pos.matched();
-                            let unrealized = matched * 1.0 - pos.total_cost();
-                            format!("pos={:.0}/{:.0} Y={:.0}@{:.0}c N={:.0}@{:.0}c PnL=${:.2}",
-                                total_pos, max_contracts,
-                                pos.yes_qty,
-                                if pos.yes_qty > 0.0 { pos.yes_cost / pos.yes_qty * 100.0 } else { 0.0 },
-                                pos.no_qty,
-                                if pos.no_qty > 0.0 { pos.no_cost / pos.no_qty * 100.0 } else { 0.0 },
-                                unrealized
-                            )
+                            let unrealized = matched * 1.0 - current_invested;
+                            format!("${:.2}/${:.0} PnL=${:.2}", current_invested, max_dollars, unrealized)
                         } else {
-                            format!("pos=0/{:.0}", max_contracts)
+                            format!("$0/${:.0}", max_dollars)
                         };
-
-                        // Liquidity
-                        let liq_str = format!("liq Y={:.0} N={:.0}", market.yes_ask_size, market.no_ask_size);
 
                         // Mid price implied probability
                         let yes_mid = (yes_bid + yes_ask) as f64 / 2.0;
                         let implied_prob = format!("prob={:.0}%", yes_mid);
 
-                        // Show filter status or trading info
-                        let status_suffix = if let Some(ref reason) = filter_reason {
-                            format!("⏸ {}", reason)
-                        } else {
-                            format!("{} {}", pos_str, thresh_flag)
-                        };
+                        // Skip markets that are filtered out (too old, expiring, waiting)
+                        if filter_reason.is_some() {
+                            continue;
+                        }
 
                         // Format pin_name with spacing if non-empty
                         let pin = market.pin_name();
                         let pin_str = if pin.is_empty() { String::new() } else { format!(" {}", pin) };
 
                         println!(
-                            "{} {} [ping_pong] {}{} spot={} | left={:.1}m | Y {}/{}c N {}/{}c | {} | {} | {}",
+                            "{} {} [ping_pong] {}{} spot={} | left={:.1}m th={}c | Y {}/{}c N {}/{}c | {} | {}{}",
                             now,
                             price_status,
                             market.asset,
                             pin_str,
                             spot,
                             expiry,
+                            threshold,
                             yes_bid, yes_ask,
                             no_bid, no_ask,
                             implied_prob,
-                            liq_str,
-                            status_suffix
+                            pos_str,
+                            near_flag
                         );
                     }
                 }
@@ -922,6 +915,8 @@ async fn main() -> Result<()> {
 
                             // Handle price change messages (real-time updates)
                             let mut handled_price_change = false;
+                            let mut trade_signals: Vec<(String, String, String, i64, bool)> = Vec::new(); // (market_id, asset, token, ask, is_yes)
+
                             if let Ok(price_msg) = serde_json::from_str::<PriceChangeMessage>(&text) {
                                 if !price_msg.price_changes.is_empty() {
                                     handled_price_change = true;
@@ -938,7 +933,7 @@ async fn main() -> Result<()> {
                                                 .unwrap_or(0);
 
                                             // Set bid/ask based on the price update (assume 1c spread)
-                                            let (old_ask, old_bid) = if is_yes {
+                                            let (old_ask, _old_bid) = if is_yes {
                                                 let old = (market.yes_ask, market.yes_bid);
                                                 market.yes_bid = Some(price_cents.saturating_sub(1).max(1));
                                                 market.yes_ask = Some((price_cents + 1).min(99));
@@ -951,13 +946,79 @@ async fn main() -> Result<()> {
                                             };
 
                                             let side = if is_yes { "YES" } else { "NO" };
-                                            if old_ask != Some((price_cents + 1).min(99)) || old_bid != Some(price_cents.saturating_sub(1).max(1)) {
-                                                trace!("[PRICE] {} {} | price={:.2} -> bid={}c ask={}c",
-                                                       market.asset, side, pc.price.parse::<f64>().unwrap_or(0.0),
-                                                       price_cents.saturating_sub(1).max(1), (price_cents + 1).min(99));
+                                            let new_ask = (price_cents + 1).min(99);
+                                            if old_ask != Some(new_ask) {
+                                                trace!("[PRICE] {} {} | price={:.2} -> ask={}c",
+                                                       market.asset, side, pc.price.parse::<f64>().unwrap_or(0.0), new_ask);
+                                            }
+
+                                            // Check for trade opportunity on price update
+                                            let mins = market.minutes_remaining().unwrap_or(0.0);
+                                            let market_age = 15.0 - mins;
+                                            if mins >= min_minutes && mins <= max_minutes && market_age <= max_age
+                                               && new_ask <= threshold && new_ask > 0 {
+                                                trade_signals.push((
+                                                    market.condition_id.clone(),
+                                                    market.asset.clone(),
+                                                    pc.asset_id.clone(),
+                                                    new_ask,
+                                                    is_yes
+                                                ));
                                             }
                                         }
                                     }
+                                }
+                            }
+
+                            // Execute trades outside the mutable borrow
+                            for (market_id, asset, token, new_ask, is_yes) in trade_signals {
+                                let current_invested = {
+                                    let s = state.read().await;
+                                    s.positions.get(&market_id).map(|p| p.total_cost()).unwrap_or(0.0)
+                                };
+
+                                if current_invested >= max_dollars {
+                                    continue;
+                                }
+
+                                let side = if is_yes { "YES" } else { "NO" };
+                                let entry_price = (new_ask + 2).min(99);
+                                let cross_price = entry_price as f64 / 100.0;
+                                let min_contracts = (1.0 / cross_price).ceil();
+                                let cost = min_contracts * cross_price;
+
+                                if !dry_run {
+                                    info!("[ping_pong] 🎯 BUYING {} {} | ask {}c < {}c threshold | {:.0} @{}c = ${:.2}",
+                                          asset, side, new_ask, threshold, min_contracts, entry_price, cost);
+                                    let client = shared_client.clone();
+                                    let state_clone = state.clone();
+                                    let market_id_spawn = market_id.clone();
+                                    let asset_clone = asset.clone();
+
+                                    tokio::spawn(async move {
+                                        match client.buy_fak(&token, cross_price, min_contracts).await {
+                                            Ok(fill) if fill.filled_size > 0.0 => {
+                                                info!("[ping_pong] ✅ {} {} FILLED {:.1} @${:.2}",
+                                                      asset_clone, side, fill.filled_size, fill.fill_cost);
+                                                let mut s = state_clone.write().await;
+                                                if let Some(pos) = s.positions.get_mut(&market_id_spawn) {
+                                                    if is_yes {
+                                                        pos.yes_qty += fill.filled_size;
+                                                        pos.yes_cost += fill.fill_cost;
+                                                    } else {
+                                                        pos.no_qty += fill.filled_size;
+                                                        pos.no_cost += fill.fill_cost;
+                                                    }
+                                                    pos.bought_crash = true;
+                                                }
+                                            }
+                                            Ok(_) => info!("[ping_pong] ❌ {} {} no fill", asset_clone, side),
+                                            Err(e) => error!("[ping_pong] ❌ {} {} error: {}", asset_clone, side, e),
+                                        }
+                                    });
+                                } else {
+                                    info!("[ping_pong] 🎯 BUYING {} {} | ask {}c < {}c threshold | {:.0} @{}c = ${:.2} (DRY RUN)",
+                                          asset, side, new_ask, threshold, min_contracts, entry_price, cost);
                                 }
                             }
 
@@ -1120,21 +1181,21 @@ async fn main() -> Result<()> {
                                             .map(|p| format!("${:.2}", p))
                                             .unwrap_or_else(|| "-".to_string());
 
-                                        // Check current position size
-                                        let current_position = {
+                                        // Check current invested dollars
+                                        let current_invested = {
                                             let s = state.read().await;
                                             s.positions.get(&market_id_clone)
-                                                .map(|p| p.yes_qty + p.no_qty)
+                                                .map(|p| p.total_cost())
                                                 .unwrap_or(0.0)
                                         };
 
-                                        if current_position >= max_contracts {
-                                            debug!("[POSITION] {} max reached ({:.0}/{:.0}), skipping",
-                                                   asset, current_position, max_contracts);
+                                        if current_invested >= max_dollars {
+                                            debug!("[POSITION] {} max reached (${:.2}/${:.0}), skipping",
+                                                   asset, current_invested, max_dollars);
                                             continue;
                                         }
 
-                                        let _remaining = max_contracts - current_position;
+                                        let remaining_dollars = max_dollars - current_invested;
 
                                         // === STRATEGY 1: Buy on crash ===
                                         // Buy YES if it drops to threshold threshold
@@ -1146,17 +1207,23 @@ async fn main() -> Result<()> {
                                             // Polymarket requires minimum $1 order value
                                             let min_contracts = (1.0 / cross_price).ceil();
 
-                                            // Use min_contracts to meet $1 minimum, even if > max_contracts
+                                            // Check if we have capacity
+                                            if remaining_dollars < 1.0 {
+                                                debug!("[ping_pong] {} skip: only ${:.2} remaining", asset, remaining_dollars);
+                                                continue;
+                                            }
+
+                                            // Use minimum contracts to meet $1 threshold
                                             {
-                                                let actual_contracts = contracts.max(min_contracts);
+                                                let actual_contracts = min_contracts;
                                                 let cost = actual_contracts * cross_price;
 
-                                                info!("[ping_pong] 🎯 {} YES @{}c | BUY {:.0} @{}c (${:.2}) | threshold={}c age={:.1}m",
-                                                      asset, yes_ask, actual_contracts, entry_price, cost, threshold, market_age);
-
                                                 if dry_run {
-                                                    info!("[ping_pong] 🔸 DRY RUN - order not sent");
+                                                    info!("[ping_pong] 🎯 BUYING {} YES | ask {}c < {}c threshold | {:.0} @{}c = ${:.2} | age {:.1}m (DRY RUN)",
+                                                          asset, yes_ask, threshold, actual_contracts, entry_price, cost, market_age);
                                                 } else {
+                                                    info!("[ping_pong] 🎯 BUYING {} YES | ask {}c < {}c threshold | {:.0} @{}c = ${:.2} | age {:.1}m",
+                                                          asset, yes_ask, threshold, actual_contracts, entry_price, cost, market_age);
                                                     let client = shared_client.clone();
                                                     let state_clone = state.clone();
                                                     let yes_token_clone = yes_token.clone();
@@ -1195,17 +1262,24 @@ async fn main() -> Result<()> {
                                             let entry_price = (no_ask + 2).min(99);
                                             let cross_price = entry_price as f64 / 100.0;
 
-                                            // Polymarket requires minimum $1 order value - use min_contracts even if > max
+                                            // Polymarket requires minimum $1 order value
                                             let min_contracts = (1.0 / cross_price).ceil();
-                                            let actual_contracts = contracts.max(min_contracts);
+
+                                            // Check if we have capacity
+                                            if remaining_dollars < 1.0 {
+                                                debug!("[ping_pong] {} skip: only ${:.2} remaining", asset, remaining_dollars);
+                                                continue;
+                                            }
+
+                                            let actual_contracts = min_contracts;
                                             let cost = actual_contracts * cross_price;
 
-                                            info!("[ping_pong] 🎯 {} NO @{}c | BUY {:.0} @{}c (${:.2}) | threshold={}c age={:.1}m",
-                                                  asset, no_ask, actual_contracts, entry_price, cost, threshold, market_age);
-
                                             if dry_run {
-                                                info!("[ping_pong] 🔸 DRY RUN - order not sent");
+                                                info!("[ping_pong] 🎯 BUYING {} NO | ask {}c < {}c threshold | {:.0} @{}c = ${:.2} | age {:.1}m (DRY RUN)",
+                                                      asset, no_ask, threshold, actual_contracts, entry_price, cost, market_age);
                                             } else {
+                                                info!("[ping_pong] 🎯 BUYING {} NO | ask {}c < {}c threshold | {:.0} @{}c = ${:.2} | age {:.1}m",
+                                                      asset, no_ask, threshold, actual_contracts, entry_price, cost, market_age);
                                                 let client = shared_client.clone();
                                                 let state_clone = state.clone();
                                                 let no_token_clone = no_token.clone();
@@ -1251,15 +1325,21 @@ async fn main() -> Result<()> {
 
                                             // Polymarket requires minimum $1 order value - use min for both sides
                                             let min_contracts = (1.0 / yes_cross.min(no_cross)).ceil();
-                                            let actual_contracts = contracts.max(min_contracts);
+                                            let actual_contracts = min_contracts;
                                             let total_cost = actual_contracts * (yes_cross + no_cross);
 
-                                            info!("[ping_pong] 🎯 {} ARB | Y={}c + N={}c = {}c | BUY {:.0} each @{}c/{}c (${:.2}) | profit={:.0}c",
-                                                  asset, yes_ask, no_ask, combined, actual_contracts, yes_entry, no_entry, total_cost, profit);
+                                            // Check if we have capacity for arb
+                                            if remaining_dollars < total_cost {
+                                                debug!("[ping_pong] {} skip arb: need ${:.2}, only ${:.2} remaining", asset, total_cost, remaining_dollars);
+                                                continue;
+                                            }
 
                                             if dry_run {
-                                                info!("[ping_pong] 🔸 DRY RUN - orders not sent");
+                                                info!("[ping_pong] 🎯 ARB {} | Y {}c + N {}c = {}c < $1 | {:.0} each @{}c/{}c = ${:.2} | +{}c profit | age {:.1}m (DRY RUN)",
+                                                      asset, yes_ask, no_ask, combined, actual_contracts, yes_entry, no_entry, total_cost, profit, market_age);
                                             } else {
+                                                info!("[ping_pong] 🎯 ARB {} | Y {}c + N {}c = {}c < $1 | {:.0} each @{}c/{}c = ${:.2} | +{}c profit | age {:.1}m",
+                                                      asset, yes_ask, no_ask, combined, actual_contracts, yes_entry, no_entry, total_cost, profit, market_age);
                                                 // Buy YES
                                                 let client = shared_client.clone();
                                                 let state_clone = state.clone();
