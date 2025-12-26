@@ -18,7 +18,7 @@ use serde_json::json;
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::sync::Arc;
-use log::info;
+use log::{debug, info};
 
 const USER_AGENT: &str = "py_clob_client";
 const MSG_TO_SIGN: &str = "This message attests that I control the given wallet";
@@ -535,7 +535,6 @@ impl PolymarketAsyncClient {
         }
 
         let resp_text = resp.text().await?;
-        info!("[get_order_async] Raw response: {}", resp_text);
 
         let parsed: PolymarketOrderResponse = serde_json::from_str(&resp_text)
             .context(format!("Failed to parse order response: {}", resp_text))?;

@@ -66,10 +66,6 @@ struct Args {
     #[arg(long)]
     sym: Option<String>,
 
-    /// Maximum total dollars to spend across all positions
-    #[arg(long, default_value_t = 10.0)]
-    max_dollars: f64,
-
     /// Minimum minutes remaining to trade (default: 2)
     #[arg(long, default_value_t = 2)]
     min_minutes: i64,
@@ -206,6 +202,68 @@ impl State {
             needs_resubscribe: false,
         }
     }
+}
+
+/// Load positions from wallet for given market tokens
+async fn load_positions_for_market(
+    client: &SharedAsyncClient,
+    market_id: &str,
+    yes_token: &str,
+    no_token: &str,
+    asset: &str,
+) -> Position {
+    let mut pos = Position::default();
+
+    // Check YES token balance and trades
+    match client.get_balance(yes_token).await {
+        Ok(yes_bal) if yes_bal > 0.0 => {
+            // Get trade history to calculate cost basis
+            let cost = match client.get_trades(yes_token).await {
+                Ok(trades) => {
+                    trades.iter()
+                        .filter(|(_, _, side)| side == "BUY")
+                        .map(|(price, size, _)| price * size)
+                        .sum()
+                }
+                Err(e) => {
+                    warn!("[POSITIONS] Failed to get YES trades for {}: {}", asset, e);
+                    0.0
+                }
+            };
+            let avg_price = if cost > 0.0 { cost / yes_bal * 100.0 } else { 0.0 };
+            info!("[POSITIONS] Found {:.1} {} YES @{:.0}¢ (cost ${:.2})", yes_bal, asset, avg_price, cost);
+            pos.yes_qty = yes_bal;
+            pos.yes_cost = cost;
+        }
+        Ok(_) => {}
+        Err(e) => warn!("[POSITIONS] Failed to get YES balance for {} ({}): {}", asset, &yes_token[..8], e),
+    }
+
+    // Check NO token balance and trades
+    match client.get_balance(no_token).await {
+        Ok(no_bal) if no_bal > 0.0 => {
+            let cost = match client.get_trades(no_token).await {
+                Ok(trades) => {
+                    trades.iter()
+                        .filter(|(_, _, side)| side == "BUY")
+                        .map(|(price, size, _)| price * size)
+                        .sum()
+                }
+                Err(e) => {
+                    warn!("[POSITIONS] Failed to get NO trades for {}: {}", asset, e);
+                    0.0
+                }
+            };
+            let avg_price = if cost > 0.0 { cost / no_bal * 100.0 } else { 0.0 };
+            info!("[POSITIONS] Found {:.1} {} NO @{:.0}¢ (cost ${:.2})", no_bal, asset, avg_price, cost);
+            pos.no_qty = no_bal;
+            pos.no_cost = cost;
+        }
+        Ok(_) => {}
+        Err(e) => warn!("[POSITIONS] Failed to get NO balance for {} ({}): {}", asset, &no_token[..8], e),
+    }
+
+    pos
 }
 
 
@@ -512,7 +570,7 @@ async fn main() -> Result<()> {
     info!("      • Time: {}m - {}m before expiry", args.min_minutes, args.max_minutes);
     info!("      • Action: BUY at ask prices immediately");
     info!("");
-    info!("   Both require: Cost < ${:.2}, Order >= $1", args.max_dollars);
+    info!("   Contracts: {} per side (min 5)", args.contracts);
     info!("");
     info!("📤 EXIT CONDITIONS:");
     info!("   • Hold until expiry (auto-settles at $1 for winner, $0 for loser)");
@@ -532,7 +590,6 @@ async fn main() -> Result<()> {
     if let Some(ref sym) = args.sym {
         info!("   Asset filter: {}", sym.to_uppercase());
     }
-    info!("   Max dollars: ${:.2}", args.max_dollars);
     info!("═══════════════════════════════════════════════════════════════════════");
 
     // Load Polymarket credentials
@@ -615,61 +672,10 @@ async fn main() -> Result<()> {
         };
 
         for (market_id, yes_token, no_token, asset) in market_tokens {
-            // Check YES token balance and trades
-            match shared_client.get_balance(&yes_token).await {
-                Ok(yes_bal) if yes_bal > 0.0 => {
-                    // Get trade history to calculate cost basis
-                    let cost = match shared_client.get_trades(&yes_token).await {
-                        Ok(trades) => {
-                            // Sum up BUY trades to get cost basis
-                            trades.iter()
-                                .filter(|(_, _, side)| side == "BUY")
-                                .map(|(price, size, _)| price * size)
-                                .sum()
-                        }
-                        Err(e) => {
-                            warn!("[POSITIONS] Failed to get YES trades for {}: {}", asset, e);
-                            0.0
-                        }
-                    };
-                    let avg_price = if cost > 0.0 { cost / yes_bal * 100.0 } else { 0.0 };
-                    info!("[POSITIONS] Found {:.1} {} YES @{:.0}¢ (cost ${:.2})", yes_bal, asset, avg_price, cost);
-                    let mut s = state.write().await;
-                    if let Some(pos) = s.positions.get_mut(&market_id) {
-                        pos.yes_qty = yes_bal;
-                        pos.yes_cost = cost;
-                    }
-                }
-                Ok(_) => {}
-                Err(e) => debug!("[POSITIONS] Failed to get YES balance: {}", e),
-            }
-
-            // Check NO token balance and trades
-            match shared_client.get_balance(&no_token).await {
-                Ok(no_bal) if no_bal > 0.0 => {
-                    // Get trade history to calculate cost basis
-                    let cost = match shared_client.get_trades(&no_token).await {
-                        Ok(trades) => {
-                            trades.iter()
-                                .filter(|(_, _, side)| side == "BUY")
-                                .map(|(price, size, _)| price * size)
-                                .sum()
-                        }
-                        Err(e) => {
-                            warn!("[POSITIONS] Failed to get NO trades for {}: {}", asset, e);
-                            0.0
-                        }
-                    };
-                    let avg_price = if cost > 0.0 { cost / no_bal * 100.0 } else { 0.0 };
-                    info!("[POSITIONS] Found {:.1} {} NO @{:.0}¢ (cost ${:.2})", no_bal, asset, avg_price, cost);
-                    let mut s = state.write().await;
-                    if let Some(pos) = s.positions.get_mut(&market_id) {
-                        pos.no_qty = no_bal;
-                        pos.no_cost = cost;
-                    }
-                }
-                Ok(_) => {}
-                Err(e) => debug!("[POSITIONS] Failed to get NO balance: {}", e),
+            let pos = load_positions_for_market(&shared_client, &market_id, &yes_token, &no_token, &asset).await;
+            if pos.yes_qty > 0.0 || pos.no_qty > 0.0 {
+                let mut s = state.write().await;
+                s.positions.insert(market_id, pos);
             }
         }
     }
@@ -696,6 +702,7 @@ async fn main() -> Result<()> {
 
     // Start periodic market discovery task
     let state_for_discovery = state.clone();
+    let client_for_discovery = shared_client.clone();
     let discovery_filter = args.sym.clone();
     let market_filter = args.market.clone();
     tokio::spawn(async move {
@@ -710,6 +717,27 @@ async fn main() -> Result<()> {
                     if let Some(ref sym) = discovery_filter {
                         let sym_upper = sym.to_uppercase();
                         discovered.retain(|m| m.asset == sym_upper);
+                    }
+
+                    // Collect new markets that need position loading (do this outside write lock)
+                    let new_markets_to_load: Vec<_> = {
+                        let s = state_for_discovery.read().await;
+                        discovered.iter()
+                            .filter(|pm| {
+                                match s.markets.get(&pm.condition_id) {
+                                    Some(existing) => existing.window_start_ts != pm.window_start_ts,
+                                    None => true,
+                                }
+                            })
+                            .map(|pm| (pm.condition_id.clone(), pm.yes_token.clone(), pm.no_token.clone(), pm.asset.clone()))
+                            .collect()
+                    };
+
+                    // Load positions for new markets (outside lock)
+                    let mut loaded_positions = Vec::new();
+                    for (id, yes_tok, no_tok, asset) in &new_markets_to_load {
+                        let pos = load_positions_for_market(&client_for_discovery, id, yes_tok, no_tok, asset).await;
+                        loaded_positions.push((id.clone(), pos));
                     }
 
                     let mut s = state_for_discovery.write().await;
@@ -729,7 +757,7 @@ async fn main() -> Result<()> {
                         expired_count += 1;
                     }
 
-                    // Add new markets
+                    // Add new markets with loaded positions
                     for pm in discovered {
                         let id = pm.condition_id.clone();
                         if let Some(existing) = s.markets.get(&id) {
@@ -739,11 +767,17 @@ async fn main() -> Result<()> {
                                       pm.asset,
                                       existing.window_start_ts.map(|t| format!("{}", t)).unwrap_or("-".into()),
                                       pm.window_start_ts);
-                                // Remove old entry and re-add with fresh state
+                                // Remove old entry and re-add
                                 s.markets.remove(&id);
                                 s.positions.remove(&id);
                                 s.orders.remove(&id);
-                                s.positions.insert(id.clone(), Position::default());
+
+                                // Use loaded position if available, otherwise default
+                                let pos = loaded_positions.iter()
+                                    .find(|(pid, _)| pid == &id)
+                                    .map(|(_, p)| p.clone())
+                                    .unwrap_or_default();
+                                s.positions.insert(id.clone(), pos);
                                 s.orders.insert(id.clone(), Orders::default());
                                 s.markets.insert(id, Market::from_polymarket(pm));
                                 new_count += 1;
@@ -751,7 +785,13 @@ async fn main() -> Result<()> {
                         } else {
                             info!("[DISCOVER] 🆕 New market: {} | {} | {:.1?}min | start_ts={:?}",
                                   pm.asset, &pm.question[..pm.question.len().min(40)], pm.expiry_minutes, pm.window_start_ts);
-                            s.positions.insert(id.clone(), Position::default());
+
+                            // Use loaded position if available, otherwise default
+                            let pos = loaded_positions.iter()
+                                .find(|(pid, _)| pid == &id)
+                                .map(|(_, p)| p.clone())
+                                .unwrap_or_default();
+                            s.positions.insert(id.clone(), pos);
                             s.orders.insert(id.clone(), Orders::default());
                             s.markets.insert(id, Market::from_polymarket(pm));
                             new_count += 1;
@@ -782,7 +822,6 @@ async fn main() -> Result<()> {
     let dry_run = !args.live;
     let min_minutes = args.min_minutes as f64;
     let max_minutes = args.max_minutes as f64;
-    let max_dollars = args.max_dollars;
     let wait_ms = args.wait_ms;
 
     loop {
@@ -866,30 +905,8 @@ async fn main() -> Result<()> {
 
                         let expiry = market.time_remaining_mins().unwrap_or(0.0);
 
-                        // Extract time window from question for logging
-                        let time_window_early = market.question
-                            .split(',')
-                            .nth(1)
-                            .and_then(|s| s.trim().split(" ET").next())
-                            .unwrap_or("-");
-
-                        // Show status for out-of-window markets but don't trade (only log every ~30s)
-                        let now_secs = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-                        if expiry < min_minutes {
-                            if now_secs % 5 == 0 {
-                                info!("[{}] {} {} | ⏰ {:.1}m remaining (< {}m min - EXPIRED)",
-                                      mode_str, market.asset, time_window_early, expiry, min_minutes);
-                            }
-                            continue;
-                        }
-                        if expiry > max_minutes {
-                            if now_secs % 5 == 0 {
-                                info!("[{}] {} {} | ⏳ {:.1}m remaining (> {}m max - waiting)",
-                                      mode_str, market.asset, time_window_early, expiry, max_minutes);
-                            }
+                        // Skip out-of-window markets silently (we only care about active ones)
+                        if expiry < min_minutes || expiry > max_minutes {
                             continue;
                         }
 
@@ -987,8 +1004,7 @@ async fn main() -> Result<()> {
                     // 1. ATM Entry: When BOTH spot near strike AND market priced as ATM (asks 35-65¢)
                     // 2. Arb Entry: When combined asks < 100¢, buy at asks (guaranteed profit)
                     const POLY_MIN_CONTRACTS: f64 = 5.0;
-                    let total_spent: f64 = s.positions.values().map(|p| p.yes_cost + p.no_cost).sum();
-                    if total_spent < max_dollars {
+                    {
                         // Collect opportunities: (market_id, yes_token, no_token, yes_ask, no_ask, asset, is_arb)
                         let trade_ops: Vec<(String, String, String, i64, i64, String, bool)> = s.markets.iter()
                             .filter_map(|(id, m)| {
@@ -1070,24 +1086,15 @@ async fn main() -> Result<()> {
                             let combined = yask + nask;
                             let entry_type = if is_arb { "ARB" } else { "ATM" };
 
-                            // Calculate remaining budget
-                            let remaining_budget = max_dollars - total_spent;
-
                             // For ARB: buy at ask price (guaranteed fill for arb profit)
                             // For ATM: bid at our bid_price
                             let y_price = if is_arb { yask } else { bid_price };
                             let n_price = if is_arb { nask } else { bid_price };
 
-                            // Need to afford BOTH sides with minimum 5 contracts each
-                            let cost_per_pair = (y_price + n_price) as f64 / 100.0;
+                            // Use contracts directly - minimum 5 for Polymarket
                             let act_c = contracts.max(POLY_MIN_CONTRACTS);
+                            let cost_per_pair = (y_price + n_price) as f64 / 100.0;
                             let total_cost = act_c * cost_per_pair;
-
-                            if total_cost > remaining_budget {
-                                warn!("[{}] ⚠️ {} SKIPPED: need ${:.2} but only ${:.2} budget (max_dollars={})",
-                                       entry_type, asset, total_cost, remaining_budget, max_dollars);
-                                continue;
-                            }
 
                             if dry_run {
                                 if is_arb {
@@ -1127,12 +1134,37 @@ async fn main() -> Result<()> {
                                 } else {
                                     // ATM: Bid at our bid_price with timed order on BOTH sides
                                     let pr = bid_price as f64 / 100.0;
+
                                     warn!("🔔🔔🔔 [ATM] 📝 BID {:.0} YES@{}¢ + NO@{}¢ (${:.2}) wait={}ms | asks Y={}¢ N={}¢ | {} 🔔🔔🔔",
                                           act_c, bid_price, bid_price, total_cost, wait_ms, yask, nask, asset);
 
-                                    // Place both orders
+                                    // Place YES order and log price at placement
                                     let yes_result = shared_client.buy_timed(&ytok, pr, act_c, wait_ms).await;
+                                    let spot_at_yes = {
+                                        let st = state.read().await;
+                                        match asset.as_str() {
+                                            "BTC" => st.prices.btc_price,
+                                            "ETH" => st.prices.eth_price,
+                                            "SOL" => st.prices.sol_price,
+                                            "XRP" => st.prices.xrp_price,
+                                            _ => None,
+                                        }
+                                    };
+                                    info!("[ORDER] YES placed | {}={}", asset, spot_at_yes.map(|p| format!("${:.2}", p)).unwrap_or("?".into()));
+
+                                    // Place NO order and log price at placement
                                     let no_result = shared_client.buy_timed(&ntok, pr, act_c, wait_ms).await;
+                                    let spot_at_no = {
+                                        let st = state.read().await;
+                                        match asset.as_str() {
+                                            "BTC" => st.prices.btc_price,
+                                            "ETH" => st.prices.eth_price,
+                                            "SOL" => st.prices.sol_price,
+                                            "XRP" => st.prices.xrp_price,
+                                            _ => None,
+                                        }
+                                    };
+                                    info!("[ORDER] NO placed | {}={}", asset, spot_at_no.map(|p| format!("${:.2}", p)).unwrap_or("?".into()));
 
                                     // Track fills
                                     let mut y_filled = 0.0;

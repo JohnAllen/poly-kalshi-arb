@@ -331,7 +331,7 @@ const POLY_SERIES_SLUGS: &[(&str, &str)] = &[
 
 /// Discover crypto markets on Polymarket
 async fn discover_markets(market_filter: Option<&str>) -> Result<Vec<Market>> {
-    info!("[DISCOVER] Starting market discovery, filter={:?}", market_filter);
+    debug!("[DISCOVER] Starting market discovery, filter={:?}", market_filter);
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -352,11 +352,11 @@ async fn discover_markets(market_filter: Option<&str>) -> Result<Vec<Market>> {
         POLY_SERIES_SLUGS.to_vec()
     };
 
-    info!("[DISCOVER] Checking {} series: {:?}", series_to_check.len(), series_to_check);
+    debug!("[DISCOVER] Checking {} series: {:?}", series_to_check.len(), series_to_check);
 
     for (series_slug, asset) in series_to_check {
         let url = format!("{}/series?slug={}", GAMMA_API_BASE, series_slug);
-        info!("[DISCOVER] Fetching series: {}", url);
+        debug!("[DISCOVER] Fetching series: {}", url);
 
         let resp = client
             .get(&url)
@@ -365,7 +365,7 @@ async fn discover_markets(market_filter: Option<&str>) -> Result<Vec<Market>> {
             .await?;
 
         let status = resp.status();
-        info!("[DISCOVER] Series '{}' response: {}", series_slug, status);
+        debug!("[DISCOVER] Series '{}' response: {}", series_slug, status);
 
         if !status.is_success() {
             warn!(
@@ -386,7 +386,7 @@ async fn discover_markets(market_filter: Option<&str>) -> Result<Vec<Market>> {
             continue;
         };
 
-        info!("[DISCOVER] Series '{}' has {} events", series_slug, events.len());
+        debug!("[DISCOVER] Series '{}' has {} events", series_slug, events.len());
 
         // Sort by end_date to get soonest-expiring markets first
         let mut filtered_events: Vec<_> = events
@@ -402,7 +402,7 @@ async fn discover_markets(market_filter: Option<&str>) -> Result<Vec<Market>> {
             .take(20)
             .collect();
 
-        info!("[DISCOVER] {} open events with orderbook: {:?}", event_slugs.len(), &event_slugs[..event_slugs.len().min(5)]);
+        debug!("[DISCOVER] {} open events with orderbook: {:?}", event_slugs.len(), &event_slugs[..event_slugs.len().min(5)]);
 
         for event_slug in event_slugs {
             let event_url = format!("{}/events?slug={}", GAMMA_API_BASE, event_slug);
@@ -505,7 +505,7 @@ async fn discover_markets(market_filter: Option<&str>) -> Result<Vec<Market>> {
     let before_dedup = markets.len();
     let mut seen = std::collections::HashSet::new();
     markets.retain(|m| seen.insert(m.condition_id.clone()));
-    info!("[DISCOVER] Deduplicated: {} -> {} markets", before_dedup, markets.len());
+    debug!("[DISCOVER] Deduplicated: {} -> {} markets", before_dedup, markets.len());
 
     // Only keep markets expiring within 16 minutes
     let before_filter = markets.len();
@@ -516,7 +516,7 @@ async fn discover_markets(market_filter: Option<&str>) -> Result<Vec<Market>> {
         }
         keep
     });
-    info!("[DISCOVER] Time filter: {} -> {} markets (kept those expiring in 0-16 mins)", before_filter, markets.len());
+    debug!("[DISCOVER] Time filter: {} -> {} markets (kept those expiring in 0-16 mins)", before_filter, markets.len());
 
     markets.sort_by(|a, b| {
         a.end_time
@@ -668,11 +668,37 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Fetch existing positions for discovered markets at startup
+    println!("Fetching existing positions from API...");
+    let mut positions_map: HashMap<String, Position> = HashMap::new();
+    let mut positions_found = 0;
+    for m in &discovered {
+        let yes_bal = shared_client.get_balance(&m.yes_token).await.unwrap_or(0.0);
+        let no_bal = shared_client.get_balance(&m.no_token).await.unwrap_or(0.0);
+        if yes_bal > 0.0 || no_bal > 0.0 {
+            println!("  {} existing position: Y={:.1} N={:.1}", m.asset, yes_bal, no_bal);
+            positions_found += 1;
+        }
+        let mut pos = Position::default();
+        pos.yes_qty = yes_bal;
+        pos.no_qty = no_bal;
+        // Estimate cost from current mid price (won't be exact but close enough)
+        // We'll update with better estimates once we get orderbook data
+        pos.yes_cost = yes_bal * 0.5; // Assume 50c avg until we know better
+        pos.no_cost = no_bal * 0.5;
+        positions_map.insert(m.condition_id.clone(), pos);
+    }
+    println!("Found {} markets with existing positions", positions_found);
+
     let state = Arc::new(RwLock::new({
         let mut s = State::new();
         for m in discovered {
             let id = m.condition_id.clone();
-            s.positions.insert(id.clone(), Position::default());
+            if let Some(pos) = positions_map.remove(&id) {
+                s.positions.insert(id.clone(), pos);
+            } else {
+                s.positions.insert(id.clone(), Position::default());
+            }
             s.markets.insert(id, m);
         }
         s
@@ -870,13 +896,15 @@ async fn main() -> Result<()> {
                             }.unwrap_or_else(|| "?".to_string())
                         };
 
-                        // Skip if at max investment
-                        if current_invested >= max_dollars {
-                            info!("[ACC] {} skip: at max ${:.2}", asset, current_invested);
+                        let is_endgame = mins_left <= endgame_mins;
+
+                        // Skip if at max investment AND balanced, BUT only during accumulator phase
+                        // (endgame always proceeds to buy winning side)
+                        let is_balanced = (yes_qty - no_qty).abs() < 0.5;
+                        if !is_endgame && current_invested >= max_dollars && is_balanced {
+                            debug!("[ACC] {} at max ${:.2} and balanced", asset, current_invested);
                             continue;
                         }
-
-                        let is_endgame = mins_left <= endgame_mins;
 
                         if is_endgame {
                             // === ENDGAME PHASE: Buy "way up" side ===
@@ -998,8 +1026,8 @@ async fn main() -> Result<()> {
                                 }
 
                                 if !dry_run {
-                                    info!("[ACC] {} BUY {} | Y={:.0} N={:.0} | {:.0} @{}c = ${:.2}",
-                                          asset, side_name, yes_qty, no_qty, actual_size, entry_price, cost);
+                                    info!("[ACC] {} {} {} BUY {} | Y={:.0} N={:.0} | {:.0} @{}c = ${:.2}",
+                                          asset, strike, spot_price, side_name, yes_qty, no_qty, actual_size, entry_price, cost);
 
                                     let client = shared_client.clone();
                                     let state_clone = state.clone();
@@ -1033,8 +1061,8 @@ async fn main() -> Result<()> {
                                         }
                                     });
                                 } else {
-                                    info!("[ACC] {} BUY {} | Y={:.0} N={:.0} | {:.0} @{}c = ${:.2} (DRY RUN)",
-                                          asset, side_name, yes_qty, no_qty, actual_size, entry_price, cost);
+                                    info!("[ACC] {} {} {} BUY {} | Y={:.0} N={:.0} | {:.0} @{}c = ${:.2} (DRY RUN)",
+                                          asset, strike, spot_price, side_name, yes_qty, no_qty, actual_size, entry_price, cost);
                                 }
                             }
                         }
@@ -1043,7 +1071,7 @@ async fn main() -> Result<()> {
 
                 _ = discovery_interval.tick() => {
                     // Periodic discovery to catch new markets when they start
-                    info!("[DISCOVER] Checking for new markets...");
+                    debug!("[DISCOVER] Checking for new markets...");
                     match discover_markets(symbol_filter.as_deref()).await {
                         Ok(discovered) => {
                             let mut s = state.write().await;
@@ -1082,19 +1110,20 @@ async fn main() -> Result<()> {
 
                 _ = status_interval.tick() => {
                     // Check for expired markets and remove them
+                    // Keep markets 5 minutes after expiry to see resolution
                     let needs_rediscovery = {
                         let mut s = state.write().await;
                         let expired_ids: Vec<String> = s.markets
                             .iter()
                             .filter(|(_, m)| {
-                                m.minutes_remaining().map(|mins| mins < -1.0).unwrap_or(true)
+                                m.minutes_remaining().map(|mins| mins < -5.0).unwrap_or(true)
                             })
                             .map(|(id, _)| id.clone())
                             .collect();
 
                         for id in &expired_ids {
                             if let Some(m) = s.markets.remove(id) {
-                                info!("[EXPIRE] Removed expired market: {} {} ({})",
+                                info!("[EXPIRE] Removed market (5m after expiry): {} {} ({})",
                                       m.asset, m.pin_name(), &id[..16]);
                             }
                             s.positions.remove(id);
@@ -1105,7 +1134,7 @@ async fn main() -> Result<()> {
 
                     // If all markets expired, break to re-discover
                     if needs_rediscovery {
-                        info!("[DISCOVER] All markets expired, breaking to re-discover...");
+                        info!("[DISCOVER] All markets expired (5m grace), breaking to re-discover...");
                         break;
                     }
 
@@ -1197,20 +1226,23 @@ async fn main() -> Result<()> {
                             let would_exceed = total_cost + min_order > max_dollars;
                             let is_balanced = (pos_yes - pos_no).abs() < 0.5;
 
+                            let mins_to_endgame = expiry - endgame_mins;
+                            let endgame_str = format!("{:.1}m to endgame", mins_to_endgame);
+
                             if pos_yes == 0.0 && pos_no == 0.0 {
                                 // No position yet - buying both sides
-                                "ACCUM BUYING".to_string()
+                                format!("ACCUM BUYING {}", endgame_str)
                             } else if would_exceed && is_balanced {
                                 // At max AND balanced - truly done
-                                format!("ACCUM DONE ${:.0}", total_cost)
+                                format!("ACCUM DONE ${:.0} {}", total_cost, endgame_str)
                             } else if pos_yes < pos_no {
                                 // Need more YES (will buy even if over max)
-                                format!("ACCUM +YES({:.0})", diff)
+                                format!("ACCUM +YES({:.0}) {}", diff, endgame_str)
                             } else if pos_no < pos_yes {
                                 // Need more NO (will buy even if over max)
-                                format!("ACCUM +NO({:.0})", diff)
+                                format!("ACCUM +NO({:.0}) {}", diff, endgame_str)
                             } else {
-                                format!("ACCUM OK({:.0})", pos_yes)
+                                format!("ACCUM OK({:.0}) {}", pos_yes, endgame_str)
                             }
                         };
 
@@ -1227,12 +1259,15 @@ async fn main() -> Result<()> {
                             "no position".to_string()
                         };
 
+                        // Get strike price for this market
+                        let strike = market.pin_name();
+
                         // Log filtered markets only if we have a position (otherwise silently skip)
                         if let Some(ref reason) = filter_reason {
                             let has_position = pos_yes > 0.0 || pos_no > 0.0;
                             if has_position {
-                                info!("[{}] {} | Y={}¢ N={}¢ | {:.1}m @{} | {} {}",
-                                      market.asset, reason,
+                                info!("[{}] {} {} | {} | Y={}¢ N={}¢ | {:.1}m @{} | {} {}",
+                                      market.asset, strike, spot, reason,
                                       yes_bid, no_bid,
                                       expiry, end_time_str,
                                       pos_str, matched_str);
@@ -1241,12 +1276,11 @@ async fn main() -> Result<()> {
                         }
 
                         // Main status line
-                        info!("[{}] {} | Y={}¢ N={}¢ | {:.1}m @{} | {} | {} {}",
-                              market.asset, spot,
+                        info!("[{}] {} {} | Y={}¢ N={}¢ | {:.1}m @{} | {} | {} {}",
+                              market.asset, strike, spot,
                               yes_bid, no_bid,
                               expiry, end_time_str, phase,
-                              pos_yes, pos_no, total_cost, pnl,
-                              matched_str);
+                              pos_str, matched_str);
                     }
                 }
 
