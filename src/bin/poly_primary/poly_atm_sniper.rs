@@ -215,6 +215,7 @@ async fn load_positions_for_market(
     let mut pos = Position::default();
 
     // Check YES token balance and trades
+    debug!("[POSITIONS] Checking {} YES token {}...", asset, &yes_token[..12.min(yes_token.len())]);
     match client.get_balance(yes_token).await {
         Ok(yes_bal) if yes_bal > 0.0 => {
             // Get trade history to calculate cost basis
@@ -231,15 +232,16 @@ async fn load_positions_for_market(
                 }
             };
             let avg_price = if cost > 0.0 { cost / yes_bal * 100.0 } else { 0.0 };
-            info!("[POSITIONS] Found {:.1} {} YES @{:.0}¢ (cost ${:.2})", yes_bal, asset, avg_price, cost);
+            info!("[POSITIONS] ✅ Found {:.1} {} YES @{:.0}¢ (cost ${:.2})", yes_bal, asset, avg_price, cost);
             pos.yes_qty = yes_bal;
             pos.yes_cost = cost;
         }
-        Ok(_) => {}
-        Err(e) => warn!("[POSITIONS] Failed to get YES balance for {} ({}): {}", asset, &yes_token[..8], e),
+        Ok(bal) => debug!("[POSITIONS] {} YES balance = {:.2}", asset, bal),
+        Err(e) => warn!("[POSITIONS] ❌ Failed to get YES balance for {} ({}): {}", asset, &yes_token[..8], e),
     }
 
     // Check NO token balance and trades
+    debug!("[POSITIONS] Checking {} NO token {}...", asset, &no_token[..12.min(no_token.len())]);
     match client.get_balance(no_token).await {
         Ok(no_bal) if no_bal > 0.0 => {
             let cost = match client.get_trades(no_token).await {
@@ -255,12 +257,12 @@ async fn load_positions_for_market(
                 }
             };
             let avg_price = if cost > 0.0 { cost / no_bal * 100.0 } else { 0.0 };
-            info!("[POSITIONS] Found {:.1} {} NO @{:.0}¢ (cost ${:.2})", no_bal, asset, avg_price, cost);
+            info!("[POSITIONS] ✅ Found {:.1} {} NO @{:.0}¢ (cost ${:.2})", no_bal, asset, avg_price, cost);
             pos.no_qty = no_bal;
             pos.no_cost = cost;
         }
-        Ok(_) => {}
-        Err(e) => warn!("[POSITIONS] Failed to get NO balance for {} ({}): {}", asset, &no_token[..8], e),
+        Ok(bal) => debug!("[POSITIONS] {} NO balance = {:.2}", asset, bal),
+        Err(e) => warn!("[POSITIONS] ❌ Failed to get NO balance for {} ({}): {}", asset, &no_token[..8], e),
     }
 
     pos
@@ -614,7 +616,8 @@ async fn main() -> Result<()> {
     let api_creds = poly_client.derive_api_key(0).await?;
     let prepared_creds = PreparedCreds::from_api_creds(&api_creds)?;
     let shared_client = Arc::new(SharedAsyncClient::new(poly_client, prepared_creds, 137));
-    info!("[POLY] API credentials ready");
+    info!("[POLY] API credentials ready, waiting for propagation...");
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     if args.live {
         warn!("⚠️  LIVE MODE - Real money!");
@@ -1138,6 +1141,14 @@ async fn main() -> Result<()> {
                                     warn!("🔔🔔🔔 [ATM] 📝 BID {:.0} YES@{}¢ + NO@{}¢ (${:.2}) wait={}ms | asks Y={}¢ N={}¢ | {} 🔔🔔🔔",
                                           act_c, bid_price, bid_price, total_cost, wait_ms, yask, nask, asset);
 
+                                    // Get strike price for logging
+                                    let strike_price = {
+                                        let st = state.read().await;
+                                        st.markets.get(&mid).and_then(|m| m.strike_price)
+                                    };
+                                    let strike_str = strike_price.map(|k| format!("${:.2}", k)).unwrap_or("?".into());
+                                    let poly_url = format!("https://polymarket.com/event/{}", mid);
+
                                     // Place YES order and log price at placement
                                     let yes_result = shared_client.buy_timed(&ytok, pr, act_c, wait_ms).await;
                                     let spot_at_yes = {
@@ -1150,7 +1161,7 @@ async fn main() -> Result<()> {
                                             _ => None,
                                         }
                                     };
-                                    info!("[ORDER] YES placed | {}={}", asset, spot_at_yes.map(|p| format!("${:.2}", p)).unwrap_or("?".into()));
+                                    info!("[ORDER] YES placed | {}={} K={} | {}", asset, spot_at_yes.map(|p| format!("${:.2}", p)).unwrap_or("?".into()), strike_str, poly_url);
 
                                     // Place NO order and log price at placement
                                     let no_result = shared_client.buy_timed(&ntok, pr, act_c, wait_ms).await;
@@ -1164,7 +1175,7 @@ async fn main() -> Result<()> {
                                             _ => None,
                                         }
                                     };
-                                    info!("[ORDER] NO placed | {}={}", asset, spot_at_no.map(|p| format!("${:.2}", p)).unwrap_or("?".into()));
+                                    info!("[ORDER] NO placed | {}={} K={} | {}", asset, spot_at_no.map(|p| format!("${:.2}", p)).unwrap_or("?".into()), strike_str, poly_url);
 
                                     // Track fills
                                     let mut y_filled = 0.0;

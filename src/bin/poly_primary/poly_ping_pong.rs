@@ -74,13 +74,19 @@ struct Args {
     #[arg(long, default_value_t = 2.0)]
     endgame_mins: f64,
 
-    /// "Way up" threshold in cents - buy this side in endgame if bid >= this (default: 92)
-    #[arg(long, default_value_t = 92)]
+    /// "Way up" BASE threshold in cents - scales up as time decreases (default: 88)
+    /// At 2m: 88c, at 1.5m: 91c, at 1m: 94c, at 0.5m: 97c
+    #[arg(long, default_value_t = 88)]
     way_up: i64,
 
     /// Endgame buy size multiplier (default: 3x normal size)
     #[arg(long, default_value_t = 3.0)]
     endgame_mult: f64,
+
+    /// Max combined spread in cents to accumulate (default: 99)
+    /// Only buy when yes_ask + no_ask <= this value
+    #[arg(long, default_value_t = 99)]
+    max_spread: i64,
 }
 
 const POLYMARKET_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
@@ -673,11 +679,31 @@ async fn main() -> Result<()> {
     let mut positions_map: HashMap<String, Position> = HashMap::new();
     let mut positions_found = 0;
     for m in &discovered {
-        let yes_bal = shared_client.get_balance(&m.yes_token).await.unwrap_or(0.0);
-        let no_bal = shared_client.get_balance(&m.no_token).await.unwrap_or(0.0);
+        let yes_bal = match shared_client.get_balance(&m.yes_token).await {
+            Ok(bal) => {
+                info!("[STARTUP] {} YES token {} balance: {:.1}", m.asset, &m.yes_token[..16], bal);
+                bal
+            }
+            Err(e) => {
+                warn!("[STARTUP] {} YES token {} get_balance FAILED: {}", m.asset, &m.yes_token[..16], e);
+                0.0
+            }
+        };
+        let no_bal = match shared_client.get_balance(&m.no_token).await {
+            Ok(bal) => {
+                info!("[STARTUP] {} NO token {} balance: {:.1}", m.asset, &m.no_token[..16], bal);
+                bal
+            }
+            Err(e) => {
+                warn!("[STARTUP] {} NO token {} get_balance FAILED: {}", m.asset, &m.no_token[..16], e);
+                0.0
+            }
+        };
         if yes_bal > 0.0 || no_bal > 0.0 {
             println!("  {} existing position: Y={:.1} N={:.1}", m.asset, yes_bal, no_bal);
             positions_found += 1;
+        } else {
+            println!("  {} no existing position", m.asset);
         }
         let mut pos = Position::default();
         pos.yes_qty = yes_bal;
@@ -720,8 +746,9 @@ async fn main() -> Result<()> {
     let buy_interval_secs = args.buy_interval;
     let buy_size = args.buy_size;
     let endgame_mins = args.endgame_mins;
-    let way_up_threshold = args.way_up;
+    let way_up_base = args.way_up;  // Base threshold, scales with time
     let endgame_mult = args.endgame_mult;
+    let max_spread = args.max_spread;
 
     loop {
         // Get current tokens from state (may have been updated by re-discovery)
@@ -743,13 +770,31 @@ async fn main() -> Result<()> {
                         continue;
                     }
                     // Fetch existing positions for discovered markets
-                    info!("[STARTUP] Fetching existing positions from API...");
+                    info!("[REDISCOVER] Fetching existing positions from API...");
                     let mut positions_found = 0;
                     for m in &discovered {
-                        let yes_bal = shared_client.get_balance(&m.yes_token).await.unwrap_or(0.0);
-                        let no_bal = shared_client.get_balance(&m.no_token).await.unwrap_or(0.0);
+                        let yes_bal = match shared_client.get_balance(&m.yes_token).await {
+                            Ok(bal) => {
+                                info!("[REDISCOVER] {} YES token {} balance: {:.1}", m.asset, &m.yes_token[..16], bal);
+                                bal
+                            }
+                            Err(e) => {
+                                warn!("[REDISCOVER] {} YES get_balance FAILED: {}", m.asset, e);
+                                0.0
+                            }
+                        };
+                        let no_bal = match shared_client.get_balance(&m.no_token).await {
+                            Ok(bal) => {
+                                info!("[REDISCOVER] {} NO token {} balance: {:.1}", m.asset, &m.no_token[..16], bal);
+                                bal
+                            }
+                            Err(e) => {
+                                warn!("[REDISCOVER] {} NO get_balance FAILED: {}", m.asset, e);
+                                0.0
+                            }
+                        };
                         if yes_bal > 0.0 || no_bal > 0.0 {
-                            info!("[STARTUP] {} existing position: Y={:.1} N={:.1}", m.asset, yes_bal, no_bal);
+                            info!("[REDISCOVER] {} existing position: Y={:.1} N={:.1}", m.asset, yes_bal, no_bal);
                             positions_found += 1;
                         }
                         let mut s = state.write().await;
@@ -762,7 +807,7 @@ async fn main() -> Result<()> {
                         pos.yes_cost = yes_bal * yes_mid;
                         pos.no_cost = no_bal * no_mid;
                     }
-                    info!("[STARTUP] Found {} markets with existing positions", positions_found);
+                    info!("[REDISCOVER] Found {} markets with existing positions", positions_found);
 
                     let mut s = state.write().await;
                     for m in discovered {
@@ -1231,18 +1276,19 @@ async fn main() -> Result<()> {
 
                             if pos_yes == 0.0 && pos_no == 0.0 {
                                 // No position yet - buying both sides
-                                format!("ACCUM BUYING {}", endgame_str)
+                                format!("ACCUM buy {:.0} Y + {:.0} N | {}", buy_size, buy_size, endgame_str)
                             } else if would_exceed && is_balanced {
                                 // At max AND balanced - truly done
-                                format!("ACCUM DONE ${:.0} {}", total_cost, endgame_str)
+                                format!("ACCUM DONE ${:.0} | {}", total_cost, endgame_str)
                             } else if pos_yes < pos_no {
                                 // Need more YES (will buy even if over max)
-                                format!("ACCUM +YES({:.0}) {}", diff, endgame_str)
+                                format!("ACCUM buy {:.0} Y (behind by {:.0}) | {}", buy_size, diff, endgame_str)
                             } else if pos_no < pos_yes {
                                 // Need more NO (will buy even if over max)
-                                format!("ACCUM +NO({:.0}) {}", diff, endgame_str)
+                                format!("ACCUM buy {:.0} N (behind by {:.0}) | {}", buy_size, diff, endgame_str)
                             } else {
-                                format!("ACCUM OK({:.0}) {}", pos_yes, endgame_str)
+                                // Balanced - buying both
+                                format!("ACCUM buy {:.0} Y + {:.0} N | {}", buy_size, buy_size, endgame_str)
                             }
                         };
 
