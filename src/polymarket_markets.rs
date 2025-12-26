@@ -192,9 +192,12 @@ pub async fn discover_markets(asset_filter: Option<&str>) -> Result<Vec<PolyMark
                     if mins > 0.0 { Some(mins) } else { None }
                 });
 
-                // Extract window start timestamp from slug (e.g., "btc-updown-15m-1766275200")
+                // Extract window start timestamp from slug (e.g., "eth-updown-15m-1735081200")
+                // The timestamp in the slug IS the window START time (not expiry)
+                // This is when Chainlink captures the reference price
                 let window_start_ts = slug.as_ref().and_then(|s| {
-                    s.rsplit('-').next()?.parse::<i64>().ok()
+                    let ts = s.rsplit('-').next()?.parse::<i64>().ok()?;
+                    Some(ts) // Use directly - this IS the start time
                 });
 
                 // Skip expired markets
@@ -338,9 +341,12 @@ pub async fn discover_all_markets(asset_filter: Option<&str>) -> Result<Vec<Poly
                     if mins > 0.0 { Some(mins) } else { None }
                 });
 
-                // Extract window start timestamp from slug (e.g., "btc-updown-15m-1766275200")
+                // Extract window start timestamp from slug (e.g., "eth-updown-15m-1735081200")
+                // The timestamp in the slug IS the window START time (not expiry)
+                // This is when Chainlink captures the reference price
                 let window_start_ts = slug.as_ref().and_then(|s| {
-                    s.rsplit('-').next()?.parse::<i64>().ok()
+                    let ts = s.rsplit('-').next()?.parse::<i64>().ok()?;
+                    Some(ts) // Use directly - this IS the start time
                 });
 
                 // Skip expired markets

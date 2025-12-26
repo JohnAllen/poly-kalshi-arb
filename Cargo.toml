@@ -93,6 +93,10 @@ path = "src/bin/poly_primary/poly_momentum.rs"
 name = "poly_atm_sniper"
 path = "src/bin/poly_primary/poly_atm_sniper.rs"
 
+[[bin]]
+name = "poly_pair_accumulator"
+path = "src/bin/poly_primary/poly_pair_accumulator.rs"
+
 [profile.release]
 opt-level = 3
 lto = true

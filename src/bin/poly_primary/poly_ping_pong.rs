@@ -1,12 +1,17 @@
-//! Polymarket Ping Pong Bot
+//! Polymarket Ping Pong Accumulator Bot
 //!
 //! STRATEGY:
-//! - Buy when price drops to a low threshold (e.g., 30¢)
-//! - When price reverts above a higher threshold (e.g., 50¢), look for arb
-//! - If YES + NO asks < $1, buy both sides for guaranteed profit
+//! 1. ACCUMULATOR PHASE (market has > endgame_mins left):
+//!    - Buy shares on BOTH sides at roughly even sizes
+//!    - Buy at regular intervals (every buy_interval seconds)
+//!    - Build an average price position as the market progresses
+//!
+//! 2. ENDGAME PHASE (market has <= endgame_mins left):
+//!    - If one side is "way up" (bid >= way_up threshold, e.g., 92c), buy that side
+//!    - This captures the likely winner when probability is very high
 //!
 //! Usage:
-//!   cargo run --release --bin poly_ping_pong -- --buy-at 30 --arb-above 50 --max-arb-cost 99
+//!   cargo run --release --bin poly_ping_pong -- --buy-interval 30 --buy-size 2 --way-up 92 --endgame-mins 2
 //!
 //! Environment:
 //!   POLY_PRIVATE_KEY - Your Polymarket/Polygon wallet private key
@@ -27,7 +32,7 @@ use tracing::{debug, error, info, trace, warn};
 
 use arb_bot::polymarket_clob::{PolymarketAsyncClient, PreparedCreds, SharedAsyncClient};
 
-/// Polymarket Ping Pong Bot
+/// Polymarket Ping Pong Accumulator Bot
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -35,15 +40,7 @@ struct Args {
     #[arg(long, default_value = "all")]
     sym: String,
 
-    /// Buy threshold in cents - buy when price drops to this level (e.g., 30 means buy at 30c or below)
-    #[arg(short, long, default_value_t = 30)]
-    threshold: i64,
-
-    /// Max total cost in cents to buy both sides for arb (default: 97 = 3c profit)
-    #[arg(long, default_value_t = 97)]
-    max_arb_cost: i64,
-
-    /// Max total dollars to invest (default: $10)
+    /// Max total dollars to invest per market (default: $10)
     #[arg(short = 'm', long, default_value_t = 10.0)]
     max_dollars: f64,
 
@@ -59,9 +56,31 @@ struct Args {
     #[arg(long, default_value_t = 14)]
     max_minutes: i64,
 
-    /// Maximum market age in minutes (default: 7 = only trade first 7 mins)
+    /// Maximum market age in minutes to start accumulating (default: 7)
     #[arg(long, default_value_t = 7.0)]
     max_age: f64,
+
+    // === ACCUMULATOR STRATEGY PARAMS ===
+
+    /// Buy interval in seconds - how often to check and buy (default: 1)
+    #[arg(long, default_value_t = 1)]
+    buy_interval: u64,
+
+    /// Size per buy in contracts (default: 2)
+    #[arg(long, default_value_t = 2.0)]
+    buy_size: f64,
+
+    /// Endgame threshold in minutes - when to switch to endgame mode (default: 2)
+    #[arg(long, default_value_t = 2.0)]
+    endgame_mins: f64,
+
+    /// "Way up" threshold in cents - buy this side in endgame if bid >= this (default: 92)
+    #[arg(long, default_value_t = 92)]
+    way_up: i64,
+
+    /// Endgame buy size multiplier (default: 3x normal size)
+    #[arg(long, default_value_t = 3.0)]
+    endgame_mult: f64,
 }
 
 const POLYMARKET_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
@@ -144,6 +163,17 @@ struct Position {
     bought_crash: bool,
 }
 
+/// Accumulator state per market
+#[derive(Debug, Clone, Default)]
+struct AccumulatorState {
+    /// Last time we bought during accumulator phase
+    last_accumulator_buy: Option<std::time::Instant>,
+    /// Whether we've done the endgame buy
+    endgame_bought: bool,
+    /// Which side we bought in endgame (true=YES, false=NO)
+    endgame_side: Option<bool>,
+}
+
 impl Position {
     fn matched(&self) -> f64 {
         self.yes_qty.min(self.no_qty)
@@ -158,6 +188,10 @@ struct State {
     markets: HashMap<String, Market>,
     positions: HashMap<String, Position>,
     prices: PriceState,
+    /// Last order attempt per token (to prevent spam)
+    last_order: HashMap<String, std::time::Instant>,
+    /// Accumulator state per market
+    accumulator: HashMap<String, AccumulatorState>,
 }
 
 impl State {
@@ -166,6 +200,8 @@ impl State {
             markets: HashMap::new(),
             positions: HashMap::new(),
             prices: PriceState::default(),
+            last_order: HashMap::new(),
+            accumulator: HashMap::new(),
         }
     }
 }
@@ -227,7 +263,7 @@ async fn run_price_feed(state: Arc<RwLock<State>>) {
                                     }
                                 }
                                 Err(e) => {
-                                    debug!("[PRICES] Parse error: {} - msg: {}", e, &text[..text.len().min(100)]);
+                                    info!("[PRICES] Parse error: {} - msg: {}", e, &text[..text.len().min(100)]);
                                 }
                             }
                         }
@@ -243,7 +279,7 @@ async fn run_price_feed(state: Arc<RwLock<State>>) {
                             break;
                         }
                         Ok(Message::Binary(data)) => {
-                            debug!("[PRICES] Received binary message: {} bytes", data.len());
+                            info!("[PRICES] Received binary message: {} bytes", data.len());
                         }
                         Ok(Message::Frame(_)) => {
                             trace!("[PRICES] Received raw frame");
@@ -316,11 +352,11 @@ async fn discover_markets(market_filter: Option<&str>) -> Result<Vec<Market>> {
         POLY_SERIES_SLUGS.to_vec()
     };
 
-    debug!("[DISCOVER] Checking {} series: {:?}", series_to_check.len(), series_to_check);
+    info!("[DISCOVER] Checking {} series: {:?}", series_to_check.len(), series_to_check);
 
     for (series_slug, asset) in series_to_check {
         let url = format!("{}/series?slug={}", GAMMA_API_BASE, series_slug);
-        debug!("[DISCOVER] Fetching series: {}", url);
+        info!("[DISCOVER] Fetching series: {}", url);
 
         let resp = client
             .get(&url)
@@ -329,7 +365,7 @@ async fn discover_markets(market_filter: Option<&str>) -> Result<Vec<Market>> {
             .await?;
 
         let status = resp.status();
-        debug!("[DISCOVER] Series '{}' response: {}", series_slug, status);
+        info!("[DISCOVER] Series '{}' response: {}", series_slug, status);
 
         if !status.is_success() {
             warn!(
@@ -342,24 +378,31 @@ async fn discover_markets(market_filter: Option<&str>) -> Result<Vec<Market>> {
 
         let series_list: Vec<GammaSeries> = resp.json().await?;
         let Some(series) = series_list.first() else {
-            debug!("[DISCOVER] No series data for '{}'", series_slug);
+            info!("[DISCOVER] No series data for '{}'", series_slug);
             continue;
         };
         let Some(events) = &series.events else {
-            debug!("[DISCOVER] No events in series '{}'", series_slug);
+            info!("[DISCOVER] No events in series '{}'", series_slug);
             continue;
         };
 
-        debug!("[DISCOVER] Series '{}' has {} events", series_slug, events.len());
+        info!("[DISCOVER] Series '{}' has {} events", series_slug, events.len());
 
-        let event_slugs: Vec<String> = events
+        // Sort by end_date to get soonest-expiring markets first
+        let mut filtered_events: Vec<_> = events
             .iter()
             .filter(|e| e.closed != Some(true) && e.enable_order_book == Some(true))
+            .collect();
+        filtered_events.sort_by(|a, b| {
+            a.end_date.cmp(&b.end_date)
+        });
+        let event_slugs: Vec<String> = filtered_events
+            .into_iter()
             .filter_map(|e| e.slug.clone())
             .take(20)
             .collect();
 
-        debug!("[DISCOVER] {} open events with orderbook: {:?}", event_slugs.len(), &event_slugs[..event_slugs.len().min(5)]);
+        info!("[DISCOVER] {} open events with orderbook: {:?}", event_slugs.len(), &event_slugs[..event_slugs.len().min(5)]);
 
         for event_slug in event_slugs {
             let event_url = format!("{}/events?slug={}", GAMMA_API_BASE, event_slug);
@@ -373,7 +416,7 @@ async fn discover_markets(market_filter: Option<&str>) -> Result<Vec<Market>> {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    debug!("[DISCOVER] Failed to fetch event '{}': {}", event_slug, e);
+                    info!("[DISCOVER] Failed to fetch event '{}': {}", event_slug, e);
                     continue;
                 }
             };
@@ -381,17 +424,17 @@ async fn discover_markets(market_filter: Option<&str>) -> Result<Vec<Market>> {
             let event_details: Vec<serde_json::Value> = match resp.json().await {
                 Ok(ed) => ed,
                 Err(e) => {
-                    debug!("[DISCOVER] Failed to parse event '{}': {}", event_slug, e);
+                    info!("[DISCOVER] Failed to parse event '{}': {}", event_slug, e);
                     continue;
                 }
             };
 
             let Some(ed) = event_details.first() else {
-                debug!("[DISCOVER] No event details for '{}'", event_slug);
+                info!("[DISCOVER] No event details for '{}'", event_slug);
                 continue;
             };
             let Some(mkts) = ed.get("markets").and_then(|m| m.as_array()) else {
-                debug!("[DISCOVER] No markets in event '{}'", event_slug);
+                info!("[DISCOVER] No markets in event '{}'", event_slug);
                 continue;
             };
 
@@ -438,8 +481,8 @@ async fn discover_markets(market_filter: Option<&str>) -> Result<Vec<Market>> {
                     continue;
                 }
 
-                debug!("[DISCOVER] Found market: {} | {} | end={:?} | yes={} no={}",
-                       asset, &question[..question.len().min(40)], end_time, &token_ids[0][..8], &token_ids[1][..8]);
+                debug!("[DISCOVER] Found market: {} | {} | end={:?}",
+                       asset, &question[..question.len().min(40)], end_time);
 
                 markets.push(Market {
                     condition_id: cid,
@@ -462,7 +505,7 @@ async fn discover_markets(market_filter: Option<&str>) -> Result<Vec<Market>> {
     let before_dedup = markets.len();
     let mut seen = std::collections::HashSet::new();
     markets.retain(|m| seen.insert(m.condition_id.clone()));
-    debug!("[DISCOVER] Deduplicated: {} -> {} markets", before_dedup, markets.len());
+    info!("[DISCOVER] Deduplicated: {} -> {} markets", before_dedup, markets.len());
 
     // Only keep markets expiring within 16 minutes
     let before_filter = markets.len();
@@ -473,7 +516,7 @@ async fn discover_markets(market_filter: Option<&str>) -> Result<Vec<Market>> {
         }
         keep
     });
-    debug!("[DISCOVER] Time filter: {} -> {} markets (kept those expiring in 0-16 mins)", before_filter, markets.len());
+    info!("[DISCOVER] Time filter: {} -> {} markets (kept those expiring in 0-16 mins)", before_filter, markets.len());
 
     markets.sort_by(|a, b| {
         a.end_time
@@ -572,15 +615,18 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     println!("═══════════════════════════════════════════════════════════════════════");
-    println!("POLYMARKET PING PONG BOT");
+    println!("POLYMARKET PING PONG ACCUMULATOR BOT");
     println!("═══════════════════════════════════════════════════════════════════════");
-    println!("Symbol: {}  |  Mode: {}  |  Max: ${:.0}",
+    println!("Symbol: {}  |  Mode: {}  |  Max: ${:.0}/market",
              args.sym.to_uppercase(),
              if args.live { "LIVE" } else { "DRY RUN" },
              args.max_dollars);
-    println!("Threshold: {}c / {}c  |  Max arb: {}c  |  Time: {}m-{}m  |  Max age: {:.0}m",
-             args.threshold, 100 - args.threshold, args.max_arb_cost,
+    println!("Time window: {}m-{}m remaining  |  Max age: {:.0}m",
              args.min_minutes, args.max_minutes, args.max_age);
+    println!("ACCUMULATOR: Buy {:.0} contracts every {}s | Build avg price on both sides",
+             args.buy_size, args.buy_interval);
+    println!("ENDGAME: At {:.1}m left, buy side with bid >= {}c ({:.0}x size)",
+             args.endgame_mins, args.way_up, args.endgame_mult);
     println!("═══════════════════════════════════════════════════════════════════════");
 
     dotenvy::dotenv().ok();
@@ -638,14 +684,18 @@ async fn main() -> Result<()> {
         run_price_feed(state_price).await;
     });
 
-    let threshold = args.threshold;
-    let max_arb_cost = args.max_arb_cost;
     let max_dollars = args.max_dollars;
     let dry_run = !args.live;
     let min_minutes = args.min_minutes as f64;
     let max_minutes = args.max_minutes as f64;
     let max_age = args.max_age;
     let log_filter = symbol_filter.clone();
+    // Accumulator strategy params
+    let buy_interval_secs = args.buy_interval;
+    let buy_size = args.buy_size;
+    let endgame_mins = args.endgame_mins;
+    let way_up_threshold = args.way_up;
+    let endgame_mult = args.endgame_mult;
 
     loop {
         // Get current tokens from state (may have been updated by re-discovery)
@@ -666,13 +716,34 @@ async fn main() -> Result<()> {
                         tokio::time::sleep(Duration::from_secs(30)).await;
                         continue;
                     }
+                    // Fetch existing positions for discovered markets
+                    info!("[STARTUP] Fetching existing positions from API...");
+                    let mut positions_found = 0;
+                    for m in &discovered {
+                        let yes_bal = shared_client.get_balance(&m.yes_token).await.unwrap_or(0.0);
+                        let no_bal = shared_client.get_balance(&m.no_token).await.unwrap_or(0.0);
+                        if yes_bal > 0.0 || no_bal > 0.0 {
+                            info!("[STARTUP] {} existing position: Y={:.1} N={:.1}", m.asset, yes_bal, no_bal);
+                            positions_found += 1;
+                        }
+                        let mut s = state.write().await;
+                        let pos = s.positions.entry(m.condition_id.clone()).or_insert_with(Position::default);
+                        pos.yes_qty = yes_bal;
+                        pos.no_qty = no_bal;
+                        // Estimate cost from current prices (won't be exact but close)
+                        let yes_mid = m.yes_bid.unwrap_or(50) as f64 / 100.0;
+                        let no_mid = m.no_bid.unwrap_or(50) as f64 / 100.0;
+                        pos.yes_cost = yes_bal * yes_mid;
+                        pos.no_cost = no_bal * no_mid;
+                    }
+                    info!("[STARTUP] Found {} markets with existing positions", positions_found);
+
                     let mut s = state.write().await;
                     for m in discovered {
                         let id = m.condition_id.clone();
-                        s.positions.entry(id.clone()).or_insert_with(Position::default);
                         s.markets.insert(id, m);
                     }
-                    info!("[DISCOVER] Added {} new markets to state", s.markets.len());
+                    info!("[DISCOVER] Added {} markets to state", s.markets.len());
                 }
                 Err(e) => {
                     error!("[DISCOVER] Discovery failed: {}", e);
@@ -703,18 +774,273 @@ async fn main() -> Result<()> {
         let _ = write.send(Message::Text(serde_json::to_string(&sub)?)).await;
         info!("[WS] Connected! Subscribed to {} tokens across {} markets", tokens.len(), tokens.len() / 2);
         println!("═════════════════════════════════════════════════════════════════════════════════════════════════════════════");
-        println!("STRATEGY: poly_ping_pong - Buy when price crashes to threshold, arb when YES+NO is cheap");
+        println!("STRATEGY: ACCUMULATOR - Buy both sides evenly, then buy 'way up' side in endgame");
         println!("═════════════════════════════════════════════════════════════════════════════════════════════════════════════");
-        println!("Sym PIN spot=price | age=market age | left=time to expiry | YES bid/ask | NO bid/ask | liq=liquidity");
+        println!("Sym | spot | left | YES bid/ask | NO bid/ask | Pos | Phase");
         println!("═════════════════════════════════════════════════════════════════════════════════════════════════════════════");
 
         let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
         let mut status_interval = tokio::time::interval(Duration::from_secs(1));
         let mut discovery_interval = tokio::time::interval(Duration::from_secs(60)); // Check for new markets every minute
+        let mut accumulator_interval = tokio::time::interval(Duration::from_secs(buy_interval_secs)); // Accumulator buys
         discovery_interval.tick().await; // Skip first tick
+        accumulator_interval.tick().await; // Skip first tick
 
         loop {
             tokio::select! {
+                _ = accumulator_interval.tick() => {
+                    // === ACCUMULATOR STRATEGY ===
+                    // Phase 1: Buy both sides evenly at intervals
+                    // Phase 2 (Endgame): Buy "way up" side when near expiry
+
+                    // Collect markets to trade (with end time and strike for logging)
+                    struct MarketInfo {
+                        id: String,
+                        asset: String,
+                        yes_token: String,
+                        no_token: String,
+                        mins_left: f64,
+                        yes_bid: i64,
+                        yes_ask: i64,
+                        no_bid: i64,
+                        no_ask: i64,
+                        end_time: Option<chrono::DateTime<chrono::Utc>>,
+                        strike: String,
+                    }
+                    let markets_to_trade: Vec<MarketInfo> = {
+                        let s = state.read().await;
+                        s.markets.iter()
+                            .filter(|(_, m)| {
+                                let mins = m.minutes_remaining().unwrap_or(0.0);
+                                let age = 15.0 - mins;
+                                mins >= min_minutes && mins <= max_minutes && age <= max_age
+                            })
+                            .map(|(id, m)| MarketInfo {
+                                id: id.clone(),
+                                asset: m.asset.clone(),
+                                yes_token: m.yes_token.clone(),
+                                no_token: m.no_token.clone(),
+                                mins_left: m.minutes_remaining().unwrap_or(0.0),
+                                yes_bid: m.yes_bid.unwrap_or(0),
+                                yes_ask: m.yes_ask.unwrap_or(100),
+                                no_bid: m.no_bid.unwrap_or(0),
+                                no_ask: m.no_ask.unwrap_or(100),
+                                end_time: m.end_time,
+                                strike: m.pin_name(),
+                            })
+                            .collect()
+                    };
+
+                    for mkt in markets_to_trade {
+                        let market_id = mkt.id;
+                        let asset = mkt.asset;
+                        let yes_token = mkt.yes_token;
+                        let no_token = mkt.no_token;
+                        let mins_left = mkt.mins_left;
+                        let yes_bid_price = mkt.yes_bid;
+                        let yes_ask = mkt.yes_ask;
+                        let no_bid_price = mkt.no_bid;
+                        let no_ask = mkt.no_ask;
+                        let end_time_str = mkt.end_time
+                            .map(|t| t.with_timezone(&chrono::Local).format("%H:%M").to_string())
+                            .unwrap_or_else(|| "??:??".to_string());
+                        let strike = mkt.strike;
+                        // Get current position and accumulator state
+                        let (current_invested, yes_qty, no_qty, acc_state) = {
+                            let s = state.read().await;
+                            let pos = s.positions.get(&market_id);
+                            let acc = s.accumulator.get(&market_id).cloned().unwrap_or_default();
+                            (
+                                pos.map(|p| p.total_cost()).unwrap_or(0.0),
+                                pos.map(|p| p.yes_qty).unwrap_or(0.0),
+                                pos.map(|p| p.no_qty).unwrap_or(0.0),
+                                acc,
+                            )
+                        };
+
+                        // Get spot price for logging
+                        let spot_price = {
+                            let s = state.read().await;
+                            match asset.as_str() {
+                                "BTC" => s.prices.btc_price.map(|p| format!("${:.0}", p)),
+                                "ETH" => s.prices.eth_price.map(|p| format!("${:.0}", p)),
+                                "SOL" => s.prices.sol_price.map(|p| format!("${:.2}", p)),
+                                "XRP" => s.prices.xrp_price.map(|p| format!("${:.4}", p)),
+                                _ => None,
+                            }.unwrap_or_else(|| "?".to_string())
+                        };
+
+                        // Skip if at max investment
+                        if current_invested >= max_dollars {
+                            info!("[ACC] {} skip: at max ${:.2}", asset, current_invested);
+                            continue;
+                        }
+
+                        let is_endgame = mins_left <= endgame_mins;
+
+                        if is_endgame {
+                            // === ENDGAME PHASE: Buy "way up" side ===
+                            if acc_state.endgame_bought {
+                                info!("[ENDGAME] {} @{} {} {} done | Y={}c N={}c | Y={:.0} N={:.0}",
+                                      asset, end_time_str, strike, spot_price,
+                                      yes_bid_price, no_bid_price, yes_qty, no_qty);
+                                continue;
+                            }
+
+                            // Check if YES is "way up" (bid >= threshold)
+                            let yes_way_up = yes_bid_price >= way_up_threshold;
+                            let no_way_up = no_bid_price >= way_up_threshold;
+
+                            if !yes_way_up && !no_way_up {
+                                info!("[ENDGAME] {} @{} {} {} waiting | Y={}c N={}c (need {}c) | Y={:.0} N={:.0}",
+                                       asset, end_time_str, strike, spot_price,
+                                       yes_bid_price, no_bid_price, way_up_threshold, yes_qty, no_qty);
+                                continue;
+                            }
+
+                            // Determine which side to buy
+                            let (buy_yes, side_name, token, ask_price) = if yes_way_up && no_way_up {
+                                // Both way up? Buy the higher one
+                                if yes_bid_price >= no_bid_price {
+                                    (true, "YES", yes_token.clone(), yes_ask)
+                                } else {
+                                    (false, "NO", no_token.clone(), no_ask)
+                                }
+                            } else if yes_way_up {
+                                (true, "YES", yes_token.clone(), yes_ask)
+                            } else {
+                                (false, "NO", no_token.clone(), no_ask)
+                            };
+
+                            let endgame_buy_size = buy_size * endgame_mult;
+                            let entry_price = (ask_price + 2).min(99);
+                            let cross_price = entry_price as f64 / 100.0;
+                            let cost = endgame_buy_size * cross_price;
+
+                            // Mark endgame as bought BEFORE sending order
+                            {
+                                let mut s = state.write().await;
+                                let acc = s.accumulator.entry(market_id.clone()).or_default();
+                                acc.endgame_bought = true;
+                                acc.endgame_side = Some(buy_yes);
+                            }
+
+                            if !dry_run {
+                                info!("[ENDGAME] {} @{} {} {} BUY {} | bid={}c >= {}c | {:.0} @{}c = ${:.2}",
+                                      asset, end_time_str, strike, spot_price, side_name,
+                                      if buy_yes { yes_bid_price } else { no_bid_price },
+                                      way_up_threshold, endgame_buy_size, entry_price, cost);
+
+                                let client = shared_client.clone();
+                                let state_clone = state.clone();
+                                let market_id_clone = market_id.clone();
+                                let asset_clone = asset.clone();
+                                let side_name_owned = side_name.to_string();
+
+                                tokio::spawn(async move {
+                                    match client.buy_fak(&token, cross_price, endgame_buy_size).await {
+                                        Ok(fill) if fill.filled_size > 0.0 => {
+                                            info!("[ENDGAME] {} {} FILLED {:.1} @${:.2}",
+                                                  asset_clone, side_name_owned, fill.filled_size, fill.fill_cost);
+                                            let mut s = state_clone.write().await;
+                                            if let Some(pos) = s.positions.get_mut(&market_id_clone) {
+                                                if buy_yes {
+                                                    pos.yes_qty += fill.filled_size;
+                                                    pos.yes_cost += fill.fill_cost;
+                                                } else {
+                                                    pos.no_qty += fill.filled_size;
+                                                    pos.no_cost += fill.fill_cost;
+                                                }
+                                            }
+                                        }
+                                        Ok(_) => warn!("[ENDGAME] {} {} no fill", asset_clone, side_name_owned),
+                                        Err(e) => error!("[ENDGAME] {} {} error: {}", asset_clone, side_name_owned, e),
+                                    }
+                                });
+                            } else {
+                                info!("[ENDGAME] {} @{} {} {} BUY {} | bid={}c >= {}c | {:.0} @{}c = ${:.2} (DRY RUN)",
+                                      asset, end_time_str, strike, spot_price, side_name,
+                                      if buy_yes { yes_bid_price } else { no_bid_price },
+                                      way_up_threshold, endgame_buy_size, entry_price, cost);
+                            }
+                        } else {
+                            // === ACCUMULATOR PHASE: Buy side that's behind to stay balanced ===
+                            // When equal (including 0/0), buy BOTH sides
+                            // When unbalanced, buy only the side that's behind
+                            let sides_to_buy: Vec<(&str, &String, i64)> = if yes_qty < no_qty {
+                                vec![("YES", &yes_token, yes_ask)]
+                            } else if no_qty < yes_qty {
+                                vec![("NO", &no_token, no_ask)]
+                            } else {
+                                // Equal (including 0/0) - buy BOTH sides
+                                vec![("YES", &yes_token, yes_ask), ("NO", &no_token, no_ask)]
+                            };
+
+                            for (side_name, token, ask_price) in sides_to_buy {
+                                let entry_price = (ask_price + 2).min(99);
+                                let cross_price = entry_price as f64 / 100.0;
+
+                                // Ensure order meets $1 minimum
+                                let min_size = (1.0 / cross_price).ceil();
+                                let actual_size = buy_size.max(min_size);
+                                let cost = actual_size * cross_price;
+
+                                // Check if we can afford this
+                                // Allow first buy even if min order > max
+                                // Allow rebalancing buys even if at max (only skip if balanced AND at max)
+                                let has_position = yes_qty > 0.0 || no_qty > 0.0;
+                                let is_rebalancing = yes_qty != no_qty;
+                                let would_exceed = current_invested + cost > max_dollars;
+
+                                if has_position && would_exceed && !is_rebalancing {
+                                    debug!("[ACC] {} skip {}: at max and balanced", asset, side_name);
+                                    continue;
+                                }
+
+                                if !dry_run {
+                                    info!("[ACC] {} BUY {} | Y={:.0} N={:.0} | {:.0} @{}c = ${:.2}",
+                                          asset, side_name, yes_qty, no_qty, actual_size, entry_price, cost);
+
+                                    let client = shared_client.clone();
+                                    let state_clone = state.clone();
+                                    let market_id_clone = market_id.clone();
+                                    let asset_clone = asset.clone();
+                                    let is_yes = side_name == "YES";
+                                    let token_clone = token.to_string();
+                                    let side_name_clone = side_name.to_string();
+
+                                    tokio::spawn(async move {
+                                        match client.buy_fak(&token_clone, cross_price, actual_size).await {
+                                            Ok(fill) if fill.filled_size > 0.0 => {
+                                                info!("[ACC] {} {} FILLED {:.1} @${:.2}",
+                                                      asset_clone, side_name_clone, fill.filled_size, fill.fill_cost);
+                                                let mut s = state_clone.write().await;
+                                                if let Some(pos) = s.positions.get_mut(&market_id_clone) {
+                                                    if is_yes {
+                                                        pos.yes_qty += fill.filled_size;
+                                                        pos.yes_cost += fill.fill_cost;
+                                                    } else {
+                                                        pos.no_qty += fill.filled_size;
+                                                        pos.no_cost += fill.fill_cost;
+                                                    }
+                                                }
+                                                // Update last buy time
+                                                let acc = s.accumulator.entry(market_id_clone).or_default();
+                                                acc.last_accumulator_buy = Some(std::time::Instant::now());
+                                            }
+                                            Ok(_) => info!("[ACC] {} {} no fill", asset_clone, side_name_clone),
+                                            Err(e) => info!("[ACC] {} {} error: {}", asset_clone, side_name_clone, e),
+                                        }
+                                    });
+                                } else {
+                                    info!("[ACC] {} BUY {} | Y={:.0} N={:.0} | {:.0} @{}c = ${:.2} (DRY RUN)",
+                                          asset, side_name, yes_qty, no_qty, actual_size, entry_price, cost);
+                                }
+                            }
+                        }
+                    }
+                }
+
                 _ = discovery_interval.tick() => {
                     // Periodic discovery to catch new markets when they start
                     info!("[DISCOVER] Checking for new markets...");
@@ -740,7 +1066,7 @@ async fn main() -> Result<()> {
                             }
                         }
                         Err(e) => {
-                            debug!("[DISCOVER] Periodic discovery failed: {}", e);
+                            info!("[DISCOVER] Periodic discovery failed: {}", e);
                         }
                     }
                 }
@@ -784,13 +1110,11 @@ async fn main() -> Result<()> {
                     }
 
                     let s = state.read().await;
-                    let now = Utc::now().format("%H:%M:%S");
 
-                    // Price feed staleness
-                    let price_age_secs = s.prices.last_update
-                        .map(|t| t.elapsed().as_secs())
-                        .unwrap_or(999);
-                    let price_status = if price_age_secs < 5 { "●" } else if price_age_secs < 30 { "○" } else { "✗" };
+                    if s.markets.is_empty() {
+                        info!("[ping_pong] No markets in state - waiting for discovery...");
+                        continue;
+                    }
 
                     for (id, market) in &s.markets {
                         // Filter by symbol if specified
@@ -828,68 +1152,101 @@ async fn main() -> Result<()> {
                         let no_ask = market.no_ask.unwrap_or(100);
                         let yes_bid = market.yes_bid.unwrap_or(0);
                         let no_bid = market.no_bid.unwrap_or(0);
-                        let combined = yes_ask + no_ask;
 
-                        // Arb analysis
-                        let arb_profit = if combined < 100 { 100 - combined } else { 0 };
-                        let _arb_flag = if combined <= max_arb_cost {
-                            format!("*ARB +{}c*", arb_profit)
+                        // Position quantities and avg costs
+                        let pos_yes = pos.yes_qty;
+                        let pos_no = pos.no_qty;
+                        let total_cost = pos.total_cost();
+                        let yes_avg = if pos_yes > 0.0 { (pos.yes_cost / pos_yes * 100.0) as i64 } else { 0 };
+                        let no_avg = if pos_no > 0.0 { (pos.no_cost / pos_no * 100.0) as i64 } else { 0 };
+
+                        // Mark-to-market PnL using bid prices (what you'd get if you sold)
+                        let yes_bid_dollars = yes_bid as f64 / 100.0;
+                        let no_bid_dollars = no_bid as f64 / 100.0;
+                        let mtm_value = pos_yes * yes_bid_dollars + pos_no * no_bid_dollars;
+                        let pnl = mtm_value - total_cost;
+                        let matched = pos_yes.min(pos_no);
+
+                        // Matched pairs indicator
+                        let matched_str = if matched > 0.0 {
+                            format!("matched:{:.0}", matched)
                         } else {
-                            format!("gap={}c", combined - 100)
+                            "".to_string()
                         };
 
-                        // Distance from threshold (use bid to show where market actually IS)
-                        // Skip NEAR when no real orderbook (bid=0)
-                        let near_flag = if yes_bid > 0 && no_bid > 0 {
-                            let yes_bid_to_thresh = yes_bid as i64 - threshold;
-                            let no_bid_to_thresh = no_bid as i64 - threshold;
-                            if yes_bid_to_thresh <= 5 || no_bid_to_thresh <= 5 {
-                                format!(" NEAR(Y{}c N{}c)", yes_bid_to_thresh, no_bid_to_thresh)
+                        // Phase indicator with accumulator details
+                        let is_endgame = expiry <= endgame_mins;
+                        let acc_state = s.accumulator.get(id).cloned().unwrap_or_default();
+                        let phase = if is_endgame {
+                            let way_up_side = if yes_bid >= way_up_threshold { "YES" }
+                                             else if no_bid >= way_up_threshold { "NO" }
+                                             else { "-" };
+                            if acc_state.endgame_bought {
+                                format!("ENDGAME({}) DONE", way_up_side)
                             } else {
-                                String::new()
+                                format!("ENDGAME({})", way_up_side)
                             }
                         } else {
-                            String::new()
+                            // Accumulator phase - show balance status
+                            let diff = (pos_yes - pos_no).abs();
+
+                            // Calculate if next order would exceed max
+                            let ask_for_behind = if pos_yes < pos_no { yes_ask } else { no_ask };
+                            let next_price = ((ask_for_behind + 2).min(99)) as f64 / 100.0;
+                            let min_order = (1.0_f64 / next_price).ceil() * next_price;
+                            let would_exceed = total_cost + min_order > max_dollars;
+                            let is_balanced = (pos_yes - pos_no).abs() < 0.5;
+
+                            if pos_yes == 0.0 && pos_no == 0.0 {
+                                // No position yet - buying both sides
+                                "ACCUM BUYING".to_string()
+                            } else if would_exceed && is_balanced {
+                                // At max AND balanced - truly done
+                                format!("ACCUM DONE ${:.0}", total_cost)
+                            } else if pos_yes < pos_no {
+                                // Need more YES (will buy even if over max)
+                                format!("ACCUM +YES({:.0})", diff)
+                            } else if pos_no < pos_yes {
+                                // Need more NO (will buy even if over max)
+                                format!("ACCUM +NO({:.0})", diff)
+                            } else {
+                                format!("ACCUM OK({:.0})", pos_yes)
+                            }
                         };
 
-                        // Position display - use dollars
-                        let current_invested = pos.total_cost();
-                        let pos_str = if current_invested > 0.0 {
-                            let matched = pos.matched();
-                            let unrealized = matched * 1.0 - current_invested;
-                            format!("${:.2}/${:.0} PnL=${:.2}", current_invested, max_dollars, unrealized)
+                        // Format end time in local timezone
+                        let end_time_str = market.end_time
+                            .map(|t| t.with_timezone(&chrono::Local).format("%H:%M:%S").to_string())
+                            .unwrap_or_else(|| "??:??".to_string());
+
+                        // Format position with avg costs
+                        let pos_str = if pos_yes > 0.0 || pos_no > 0.0 {
+                            format!("Y={:.0}@{}¢ N={:.0}@{}¢ ${:.2} PnL=${:+.2}",
+                                    pos_yes, yes_avg, pos_no, no_avg, total_cost, pnl)
                         } else {
-                            format!("$0/${:.0}", max_dollars)
+                            "no position".to_string()
                         };
 
-                        // Mid price implied probability
-                        let yes_mid = (yes_bid + yes_ask) as f64 / 2.0;
-                        let implied_prob = format!("prob={:.0}%", yes_mid);
-
-                        // Skip markets that are filtered out (too old, expiring, waiting)
-                        if filter_reason.is_some() {
+                        // Log filtered markets only if we have a position (otherwise silently skip)
+                        if let Some(ref reason) = filter_reason {
+                            let has_position = pos_yes > 0.0 || pos_no > 0.0;
+                            if has_position {
+                                info!("[{}] {} | Y={}¢ N={}¢ | {:.1}m @{} | {} {}",
+                                      market.asset, reason,
+                                      yes_bid, no_bid,
+                                      expiry, end_time_str,
+                                      pos_str, matched_str);
+                            }
                             continue;
                         }
 
-                        // Format pin_name with spacing if non-empty
-                        let pin = market.pin_name();
-                        let pin_str = if pin.is_empty() { String::new() } else { format!(" {}", pin) };
-
-                        println!(
-                            "{} {} [ping_pong] {}{} spot={} | left={:.1}m th={}c | Y {}/{}c N {}/{}c | {} | {}{}",
-                            now,
-                            price_status,
-                            market.asset,
-                            pin_str,
-                            spot,
-                            expiry,
-                            threshold,
-                            yes_bid, yes_ask,
-                            no_bid, no_ask,
-                            implied_prob,
-                            pos_str,
-                            near_flag
-                        );
+                        // Main status line
+                        info!("[{}] {} | Y={}¢ N={}¢ | {:.1}m @{} | {} | {} {}",
+                              market.asset, spot,
+                              yes_bid, no_bid,
+                              expiry, end_time_str, phase,
+                              pos_yes, pos_no, total_cost, pnl,
+                              matched_str);
                     }
                 }
 
@@ -915,7 +1272,6 @@ async fn main() -> Result<()> {
 
                             // Handle price change messages (real-time updates)
                             let mut handled_price_change = false;
-                            let mut trade_signals: Vec<(String, String, String, i64, bool)> = Vec::new(); // (market_id, asset, token, ask, is_yes)
 
                             if let Ok(price_msg) = serde_json::from_str::<PriceChangeMessage>(&text) {
                                 if !price_msg.price_changes.is_empty() {
@@ -933,95 +1289,20 @@ async fn main() -> Result<()> {
                                                 .unwrap_or(0);
 
                                             // Set bid/ask based on the price update (assume 1c spread)
-                                            let (old_ask, _old_bid) = if is_yes {
-                                                let old = (market.yes_ask, market.yes_bid);
+                                            if is_yes {
                                                 market.yes_bid = Some(price_cents.saturating_sub(1).max(1));
                                                 market.yes_ask = Some((price_cents + 1).min(99));
-                                                old
                                             } else {
-                                                let old = (market.no_ask, market.no_bid);
                                                 market.no_bid = Some(price_cents.saturating_sub(1).max(1));
                                                 market.no_ask = Some((price_cents + 1).min(99));
-                                                old
                                             };
-
-                                            let side = if is_yes { "YES" } else { "NO" };
-                                            let new_ask = (price_cents + 1).min(99);
-                                            if old_ask != Some(new_ask) {
-                                                trace!("[PRICE] {} {} | price={:.2} -> ask={}c",
-                                                       market.asset, side, pc.price.parse::<f64>().unwrap_or(0.0), new_ask);
-                                            }
-
-                                            // Check for trade opportunity on price update
-                                            let mins = market.minutes_remaining().unwrap_or(0.0);
-                                            let market_age = 15.0 - mins;
-                                            if mins >= min_minutes && mins <= max_minutes && market_age <= max_age
-                                               && new_ask <= threshold && new_ask > 0 {
-                                                trade_signals.push((
-                                                    market.condition_id.clone(),
-                                                    market.asset.clone(),
-                                                    pc.asset_id.clone(),
-                                                    new_ask,
-                                                    is_yes
-                                                ));
-                                            }
+                                            // Price updates are handled by accumulator_interval, no reactive trading
                                         }
                                     }
                                 }
                             }
 
-                            // Execute trades outside the mutable borrow
-                            for (market_id, asset, token, new_ask, is_yes) in trade_signals {
-                                let current_invested = {
-                                    let s = state.read().await;
-                                    s.positions.get(&market_id).map(|p| p.total_cost()).unwrap_or(0.0)
-                                };
-
-                                if current_invested >= max_dollars {
-                                    continue;
-                                }
-
-                                let side = if is_yes { "YES" } else { "NO" };
-                                let entry_price = (new_ask + 2).min(99);
-                                let cross_price = entry_price as f64 / 100.0;
-                                let min_contracts = (1.0 / cross_price).ceil();
-                                let cost = min_contracts * cross_price;
-
-                                if !dry_run {
-                                    info!("[ping_pong] 🎯 BUYING {} {} | ask {}c < {}c threshold | {:.0} @{}c = ${:.2}",
-                                          asset, side, new_ask, threshold, min_contracts, entry_price, cost);
-                                    let client = shared_client.clone();
-                                    let state_clone = state.clone();
-                                    let market_id_spawn = market_id.clone();
-                                    let asset_clone = asset.clone();
-
-                                    tokio::spawn(async move {
-                                        match client.buy_fak(&token, cross_price, min_contracts).await {
-                                            Ok(fill) if fill.filled_size > 0.0 => {
-                                                info!("[ping_pong] ✅ {} {} FILLED {:.1} @${:.2}",
-                                                      asset_clone, side, fill.filled_size, fill.fill_cost);
-                                                let mut s = state_clone.write().await;
-                                                if let Some(pos) = s.positions.get_mut(&market_id_spawn) {
-                                                    if is_yes {
-                                                        pos.yes_qty += fill.filled_size;
-                                                        pos.yes_cost += fill.fill_cost;
-                                                    } else {
-                                                        pos.no_qty += fill.filled_size;
-                                                        pos.no_cost += fill.fill_cost;
-                                                    }
-                                                    pos.bought_crash = true;
-                                                }
-                                            }
-                                            Ok(_) => info!("[ping_pong] ❌ {} {} no fill", asset_clone, side),
-                                            Err(e) => error!("[ping_pong] ❌ {} {} error: {}", asset_clone, side, e),
-                                        }
-                                    });
-                                } else {
-                                    info!("[ping_pong] 🎯 BUYING {} {} | ask {}c < {}c threshold | {:.0} @{}c = ${:.2} (DRY RUN)",
-                                          asset, side, new_ask, threshold, min_contracts, entry_price, cost);
-                                }
-                            }
-
+                            // Book snapshots update the orderbook state
                             if !books.is_empty() {
                                 debug!("[WS] Parsed {} book snapshots", books.len());
 
@@ -1037,7 +1318,7 @@ async fn main() -> Result<()> {
                                             .map(|(id, _)| id.clone());
 
                                         let Some(market_id) = market_id else {
-                                            debug!("[WS] Unknown asset_id: {}", &book.asset_id[..book.asset_id.len().min(16)]);
+                                            info!("[WS] Unknown asset_id: {}", &book.asset_id[..book.asset_id.len().min(16)]);
                                             continue;
                                         };
 
@@ -1082,7 +1363,7 @@ async fn main() -> Result<()> {
                                             .sum();
 
                                         let Some(market) = s.markets.get_mut(&market_id) else {
-                                            debug!("[WS] Market {} not found in state", &market_id[..16]);
+                                            info!("[WS] Market {} not found in state", &market_id[..16]);
                                             continue;
                                         };
 
@@ -1106,6 +1387,26 @@ async fn main() -> Result<()> {
                                             market.no_ask_size = total_ask_size;
                                         }
 
+                                        // Sanity check: YES bid + NO bid should sum close to 100
+                                        let y_bid = market.yes_bid.unwrap_or(0);
+                                        let n_bid = market.no_bid.unwrap_or(0);
+                                        let bid_sum = y_bid + n_bid;
+                                        if bid_sum > 0 && (bid_sum < 85 || bid_sum > 115) {
+                                            // Prices inconsistent, revert this update
+                                            info!("[BOOK] {} {} REJECTED: Y_bid={}c + N_bid={}c = {}c (not ~100c)",
+                                                   market.asset, side, y_bid, n_bid, bid_sum);
+                                            if is_yes {
+                                                market.yes_ask = old_ask;
+                                                market.yes_bid = old_bid;
+                                                market.yes_ask_size = old_size;
+                                            } else {
+                                                market.no_ask = old_ask;
+                                                market.no_bid = old_bid;
+                                                market.no_ask_size = old_size;
+                                            }
+                                            continue;
+                                        }
+
                                         // Log orderbook changes
                                         let new_ask = best_ask.map(|(p, _)| p);
                                         let new_bid = best_bid.map(|(p, _)| p);
@@ -1114,7 +1415,7 @@ async fn main() -> Result<()> {
                                         let size_changed = (old_size - total_ask_size).abs() > 0.01;
 
                                         if ask_changed || bid_changed {
-                                            info!("[BOOK] {} {} | bid: {:?}c->{:?}c | ask: {:?}c->{:?}c",
+                                            debug!("[BOOK] {} {} | bid: {:?}c->{:?}c | ask: {:?}c->{:?}c",
                                                    market.asset, side,
                                                    old_bid, new_bid,
                                                    old_ask, new_ask);
@@ -1128,275 +1429,7 @@ async fn main() -> Result<()> {
                                                    market.asset, side, new_bid, new_ask, total_ask_size);
                                         }
 
-                                        // Log full book depth at trace level
-                                        if !book.asks.is_empty() || !book.bids.is_empty() {
-                                            trace!("[BOOK] {} {} depth: {} bids (total={:.0}) / {} asks (total={:.0})",
-                                                   market.asset, side,
-                                                   book.bids.len(), total_bid_size,
-                                                   book.asks.len(), total_ask_size);
-                                        }
-
-                                        // Extract values
-                                        let asset = market.asset.clone();
-                                        let mins = market.minutes_remaining().unwrap_or(0.0);
-                                        let yes_ask_price = market.yes_ask;
-                                        let no_ask_price = market.no_ask;
-                                        let yes_token = market.yes_token.clone();
-                                        let no_token = market.no_token.clone();
-                                        let _question = market.question.clone();
-
-                                        // Get underlying price for this asset
-                                        let underlying_price = match asset.as_str() {
-                                            "BTC" => s.prices.btc_price,
-                                            "ETH" => s.prices.eth_price,
-                                            "SOL" => s.prices.sol_price,
-                                            "XRP" => s.prices.xrp_price,
-                                            _ => None,
-                                        };
-
-                                        let market_age = 15.0 - mins; // How many minutes into the market
-
-                                        // Log filtering decisions
-                                        if mins < min_minutes {
-                                            trace!("[FILTER] {} skipped: mins={:.1} < min_minutes={:.1}", asset, mins, min_minutes);
-                                            continue;
-                                        }
-                                        if mins > max_minutes {
-                                            trace!("[FILTER] {} skipped: mins={:.1} > max_minutes={:.1}", asset, mins, max_minutes);
-                                            continue;
-                                        }
-                                        if market_age > max_age {
-                                            trace!("[FILTER] {} skipped: age={:.1}m > max_age={:.1}m", asset, market_age, max_age);
-                                            continue;
-                                        }
-
-                                        let yes_ask = yes_ask_price.unwrap_or(100);
-                                        let no_ask = no_ask_price.unwrap_or(100);
-
-                                        let market_id_clone = market_id.clone();
-                                        drop(s);
-
-                                        // Format underlying price
-                                        let _spot_str = underlying_price
-                                            .map(|p| format!("${:.2}", p))
-                                            .unwrap_or_else(|| "-".to_string());
-
-                                        // Check current invested dollars
-                                        let current_invested = {
-                                            let s = state.read().await;
-                                            s.positions.get(&market_id_clone)
-                                                .map(|p| p.total_cost())
-                                                .unwrap_or(0.0)
-                                        };
-
-                                        if current_invested >= max_dollars {
-                                            debug!("[POSITION] {} max reached (${:.2}/${:.0}), skipping",
-                                                   asset, current_invested, max_dollars);
-                                            continue;
-                                        }
-
-                                        let remaining_dollars = max_dollars - current_invested;
-
-                                        // === STRATEGY 1: Buy on crash ===
-                                        // Buy YES if it drops to threshold threshold
-                                        if yes_ask <= threshold && yes_ask > 0 {
-                                            // Add 2c to cross the spread and ensure FAK fills
-                                            let entry_price = (yes_ask + 2).min(99);
-                                            let cross_price = entry_price as f64 / 100.0;
-
-                                            // Polymarket requires minimum $1 order value
-                                            let min_contracts = (1.0 / cross_price).ceil();
-
-                                            // Check if we have capacity
-                                            if remaining_dollars < 1.0 {
-                                                debug!("[ping_pong] {} skip: only ${:.2} remaining", asset, remaining_dollars);
-                                                continue;
-                                            }
-
-                                            // Use minimum contracts to meet $1 threshold
-                                            {
-                                                let actual_contracts = min_contracts;
-                                                let cost = actual_contracts * cross_price;
-
-                                                if dry_run {
-                                                    info!("[ping_pong] 🎯 BUYING {} YES | ask {}c < {}c threshold | {:.0} @{}c = ${:.2} | age {:.1}m (DRY RUN)",
-                                                          asset, yes_ask, threshold, actual_contracts, entry_price, cost, market_age);
-                                                } else {
-                                                    info!("[ping_pong] 🎯 BUYING {} YES | ask {}c < {}c threshold | {:.0} @{}c = ${:.2} | age {:.1}m",
-                                                          asset, yes_ask, threshold, actual_contracts, entry_price, cost, market_age);
-                                                    let client = shared_client.clone();
-                                                    let state_clone = state.clone();
-                                                    let yes_token_clone = yes_token.clone();
-                                                    let market_id_for_spawn = market_id_clone.clone();
-                                                    let asset_clone = asset.clone();
-
-                                                    // Execute trade asynchronously
-                                                    tokio::spawn(async move {
-                                                        match client.buy_fak(&yes_token_clone, cross_price, actual_contracts).await {
-                                                            Ok(fill) if fill.filled_size > 0.0 => {
-                                                                info!("[ping_pong] ✅ {} YES FILLED {:.1} @${:.2}",
-                                                                      asset_clone, fill.filled_size, fill.fill_cost);
-
-                                                                let mut s = state_clone.write().await;
-                                                                if let Some(pos) = s.positions.get_mut(&market_id_for_spawn) {
-                                                                    pos.yes_qty += fill.filled_size;
-                                                                    pos.yes_cost += fill.fill_cost;
-                                                                    pos.bought_crash = true;
-                                                                }
-                                                            }
-                                                            Ok(_) => {
-                                                                info!("[ping_pong] ❌ {} YES no fill (FAK killed)", asset_clone);
-                                                            }
-                                                            Err(e) => {
-                                                                error!("[ping_pong] ❌ {} YES order error: {}", asset_clone, e);
-                                                            }
-                                                        }
-                                                    });
-                                                }
-                                            }
-                                        }
-
-                                        // Buy NO if it drops to threshold
-                                        if no_ask <= threshold && no_ask > 0 {
-                                            // Add 2c to cross the spread and ensure FAK fills
-                                            let entry_price = (no_ask + 2).min(99);
-                                            let cross_price = entry_price as f64 / 100.0;
-
-                                            // Polymarket requires minimum $1 order value
-                                            let min_contracts = (1.0 / cross_price).ceil();
-
-                                            // Check if we have capacity
-                                            if remaining_dollars < 1.0 {
-                                                debug!("[ping_pong] {} skip: only ${:.2} remaining", asset, remaining_dollars);
-                                                continue;
-                                            }
-
-                                            let actual_contracts = min_contracts;
-                                            let cost = actual_contracts * cross_price;
-
-                                            if dry_run {
-                                                info!("[ping_pong] 🎯 BUYING {} NO | ask {}c < {}c threshold | {:.0} @{}c = ${:.2} | age {:.1}m (DRY RUN)",
-                                                      asset, no_ask, threshold, actual_contracts, entry_price, cost, market_age);
-                                            } else {
-                                                info!("[ping_pong] 🎯 BUYING {} NO | ask {}c < {}c threshold | {:.0} @{}c = ${:.2} | age {:.1}m",
-                                                      asset, no_ask, threshold, actual_contracts, entry_price, cost, market_age);
-                                                let client = shared_client.clone();
-                                                let state_clone = state.clone();
-                                                let no_token_clone = no_token.clone();
-                                                let market_id_for_spawn = market_id_clone.clone();
-                                                let asset_clone = asset.clone();
-
-                                                // Execute trade asynchronously
-                                                tokio::spawn(async move {
-                                                    match client.buy_fak(&no_token_clone, cross_price, actual_contracts).await {
-                                                        Ok(fill) if fill.filled_size > 0.0 => {
-                                                            info!("[ping_pong] ✅ {} NO FILLED {:.1} @${:.2}",
-                                                                  asset_clone, fill.filled_size, fill.fill_cost);
-
-                                                            let mut s = state_clone.write().await;
-                                                            if let Some(pos) = s.positions.get_mut(&market_id_for_spawn) {
-                                                                pos.no_qty += fill.filled_size;
-                                                                pos.no_cost += fill.fill_cost;
-                                                                pos.bought_crash = true;
-                                                            }
-                                                        }
-                                                        Ok(_) => {
-                                                            info!("[ping_pong] ❌ {} NO no fill (FAK killed)", asset_clone);
-                                                        }
-                                                        Err(e) => {
-                                                            error!("[ping_pong] ❌ {} NO order error: {}", asset_clone, e);
-                                                        }
-                                                    }
-                                                });
-                                            }
-                                        }
-
-                                        // === STRATEGY 2: Arb when both sides cheap ===
-                                        // If YES + NO <= max_arb_cost, buy both for guaranteed profit
-                                        let combined = yes_ask + no_ask;
-                                        if combined <= max_arb_cost && yes_ask > 0 && no_ask > 0 {
-                                            let profit = 100 - combined;
-
-                                            // Add 2c to cross spreads
-                                            let yes_entry = (yes_ask + 2).min(99);
-                                            let no_entry = (no_ask + 2).min(99);
-                                            let yes_cross = yes_entry as f64 / 100.0;
-                                            let no_cross = no_entry as f64 / 100.0;
-
-                                            // Polymarket requires minimum $1 order value - use min for both sides
-                                            let min_contracts = (1.0 / yes_cross.min(no_cross)).ceil();
-                                            let actual_contracts = min_contracts;
-                                            let total_cost = actual_contracts * (yes_cross + no_cross);
-
-                                            // Check if we have capacity for arb
-                                            if remaining_dollars < total_cost {
-                                                debug!("[ping_pong] {} skip arb: need ${:.2}, only ${:.2} remaining", asset, total_cost, remaining_dollars);
-                                                continue;
-                                            }
-
-                                            if dry_run {
-                                                info!("[ping_pong] 🎯 ARB {} | Y {}c + N {}c = {}c < $1 | {:.0} each @{}c/{}c = ${:.2} | +{}c profit | age {:.1}m (DRY RUN)",
-                                                      asset, yes_ask, no_ask, combined, actual_contracts, yes_entry, no_entry, total_cost, profit, market_age);
-                                            } else {
-                                                info!("[ping_pong] 🎯 ARB {} | Y {}c + N {}c = {}c < $1 | {:.0} each @{}c/{}c = ${:.2} | +{}c profit | age {:.1}m",
-                                                      asset, yes_ask, no_ask, combined, actual_contracts, yes_entry, no_entry, total_cost, profit, market_age);
-                                                // Buy YES
-                                                let client = shared_client.clone();
-                                                let state_clone = state.clone();
-                                                let yes_token_clone = yes_token.clone();
-                                                let market_id_for_spawn = market_id_clone.clone();
-                                                let asset_clone = asset.clone();
-
-                                                tokio::spawn(async move {
-                                                    match client.buy_fak(&yes_token_clone, yes_cross, actual_contracts).await {
-                                                        Ok(fill) if fill.filled_size > 0.0 => {
-                                                            info!("[ping_pong] ✅ {} ARB YES FILLED {:.1} @${:.2}",
-                                                                  asset_clone, fill.filled_size, fill.fill_cost);
-
-                                                            let mut s = state_clone.write().await;
-                                                            if let Some(pos) = s.positions.get_mut(&market_id_for_spawn) {
-                                                                pos.yes_qty += fill.filled_size;
-                                                                pos.yes_cost += fill.fill_cost;
-                                                            }
-                                                        }
-                                                        Ok(_) => {
-                                                            info!("[ping_pong] ❌ {} ARB YES no fill", asset_clone);
-                                                        }
-                                                        Err(e) => {
-                                                            error!("[ping_pong] ❌ {} ARB YES error: {}", asset_clone, e);
-                                                        }
-                                                    }
-                                                });
-
-                                                // Buy NO
-                                                let client = shared_client.clone();
-                                                let state_clone = state.clone();
-                                                let no_token_clone = no_token.clone();
-                                                let market_id_for_spawn = market_id_clone.clone();
-                                                let asset_clone = asset.clone();
-
-                                                tokio::spawn(async move {
-                                                    match client.buy_fak(&no_token_clone, no_cross, actual_contracts).await {
-                                                        Ok(fill) if fill.filled_size > 0.0 => {
-                                                            info!("[ping_pong] ✅ {} ARB NO FILLED {:.1} @${:.2}",
-                                                                  asset_clone, fill.filled_size, fill.fill_cost);
-
-                                                            let mut s = state_clone.write().await;
-                                                            if let Some(pos) = s.positions.get_mut(&market_id_for_spawn) {
-                                                                pos.no_qty += fill.filled_size;
-                                                                pos.no_cost += fill.fill_cost;
-                                                            }
-                                                        }
-                                                        Ok(_) => {
-                                                            info!("[ping_pong] ❌ {} ARB NO no fill", asset_clone);
-                                                        }
-                                                        Err(e) => {
-                                                            error!("[ping_pong] ❌ {} ARB NO error: {}", asset_clone, e);
-                                                        }
-                                                    }
-                                                });
-                                            }
-                                        }
+                                        // All trading is handled by accumulator_interval, not reactive to book updates
                                     }
                             } else if !text.is_empty() && !handled_price_change {
                                 // Failed to parse as book snapshot or price change - log what we received
@@ -1415,7 +1448,7 @@ async fn main() -> Result<()> {
                             trace!("[WS] Received pong");
                         }
                         Ok(Message::Binary(data)) => {
-                            debug!("[WS] Received binary: {} bytes", data.len());
+                            info!("[WS] Received binary: {} bytes", data.len());
                         }
                         Ok(Message::Close(frame)) => {
                             warn!("[WS] Received close frame: {:?}", frame);

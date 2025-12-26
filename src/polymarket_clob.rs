@@ -555,6 +555,72 @@ impl PolymarketAsyncClient {
         Ok(val["neg_risk"].as_bool().unwrap_or(false))
     }
 
+    /// Get balance for a specific token
+    pub async fn get_balance(&self, token_id: &str, creds: &PreparedCreds) -> Result<f64> {
+        let path = format!("/balance-allowance?asset_type=CONDITIONAL&token_id={}", token_id);
+        let url = format!("{}{}", self.host, path);
+        let headers = self.build_l2_headers("GET", &path, None, creds)?;
+
+        let resp = self.http
+            .get(&url)
+            .headers(headers)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("get_balance failed {}: {}", status, body));
+        }
+
+        let val: serde_json::Value = resp.json().await?;
+        // Response format: {"balance": "123.45", ...}
+        let balance_str = val["balance"].as_str().unwrap_or("0");
+        let balance = balance_str.parse::<f64>().unwrap_or(0.0);
+        Ok(balance)
+    }
+
+    /// Get trades for a specific asset (token)
+    /// Returns Vec of (price, size, side) tuples
+    pub async fn get_trades(&self, asset_id: &str, creds: &PreparedCreds) -> Result<Vec<(f64, f64, String)>> {
+        let path = format!("/data/trades?asset_id={}", asset_id);
+        let url = format!("{}{}", self.host, path);
+        let headers = self.build_l2_headers("GET", &path, None, creds)?;
+
+        let resp = self.http
+            .get(&url)
+            .headers(headers)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("get_trades failed {}: {}", status, body));
+        }
+
+        let val: serde_json::Value = resp.json().await?;
+        let mut trades = Vec::new();
+
+        // Parse trades array
+        if let Some(arr) = val.as_array() {
+            for trade in arr {
+                let price = trade["price"].as_str()
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .unwrap_or(0.0);
+                let size = trade["size"].as_str()
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .unwrap_or(0.0);
+                let side = trade["side"].as_str().unwrap_or("BUY").to_string();
+                if size > 0.0 {
+                    trades.push((price, size, side));
+                }
+            }
+        }
+
+        Ok(trades)
+    }
+
     #[allow(dead_code)]
     pub fn wallet_address(&self) -> &str {
         &self.wallet_address_str
@@ -568,6 +634,32 @@ impl PolymarketAsyncClient {
     #[allow(dead_code)]
     pub fn wallet(&self) -> &LocalWallet {
         &self.wallet
+    }
+
+    /// Cancel an order by ID
+    pub async fn cancel_order_async(&self, order_id: &str, creds: &PreparedCreds) -> Result<bool> {
+        let path = "/order";
+        let url = format!("{}{}", self.host, path);
+        let body = serde_json::json!({ "orderID": order_id }).to_string();
+        let headers = self.build_l2_headers("DELETE", path, Some(&body), creds)?;
+
+        let resp = self.http
+            .delete(&url)
+            .headers(headers)
+            .body(body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            // Already cancelled or filled is not an error
+            if body.contains("not found") || body.contains("already") {
+                return Ok(true);
+            }
+            return Err(anyhow!("cancel_order failed {}: {}", status, body));
+        }
+        Ok(true)
     }
 }
 
@@ -600,12 +692,48 @@ impl SharedAsyncClient {
         Ok(count)
     }
 
+    /// Get balance for a specific token
+    pub async fn get_balance(&self, token_id: &str) -> Result<f64> {
+        self.inner.get_balance(token_id, &self.creds).await
+    }
+
+    /// Get trades for a specific token, returns (price, size, side)
+    pub async fn get_trades(&self, token_id: &str) -> Result<Vec<(f64, f64, String)>> {
+        self.inner.get_trades(token_id, &self.creds).await
+    }
+
     /// Execute FAK buy order
     pub async fn buy_fak(&self, token_id: &str, price: f64, size: f64) -> Result<PolyFillAsync> {
         if size < 1.0 {
             return Err(anyhow!("size must be >= 1, got {}", size));
         }
         self.execute_order(token_id, price, size, "BUY").await
+    }
+
+    /// Post a GTC (Good Till Cancelled) bid order - returns order_id
+    pub async fn post_gtc_bid(&self, token_id: &str, price: f64, size: f64) -> Result<String> {
+        if size < 1.0 {
+            return Err(anyhow!("size must be >= 1, got {}", size));
+        }
+        if price <= 0.0 || price >= 1.0 {
+            return Err(anyhow!("price must be 0 < p < 1, got {}", price));
+        }
+        let result = self.execute_order_with_type(token_id, price, size, "BUY", PolyOrderType::GTC).await?;
+        Ok(result.order_id)
+    }
+
+    /// Check order status - returns (status, filled_size, price)
+    /// Status: "LIVE", "MATCHED", "CANCELED" or error
+    pub async fn check_order_status(&self, order_id: &str) -> Result<(String, f64, f64)> {
+        let order_info = self.inner.get_order_async(order_id, &self.creds).await?;
+        let filled_size: f64 = order_info.size_matched.parse().unwrap_or(0.0);
+        let price: f64 = order_info.price.parse().unwrap_or(0.0);
+        Ok((order_info.status, filled_size, price))
+    }
+
+    /// Cancel an open order
+    pub async fn cancel_order(&self, order_id: &str) -> Result<bool> {
+        self.inner.cancel_order_async(order_id, &self.creds).await
     }
 
     /// Execute FAK sell order
@@ -618,6 +746,56 @@ impl SharedAsyncClient {
         }
         info!("[POLY] SELL {:.1} @ {:.2}", size, price);
         self.execute_order(token_id, price, size, "SELL").await
+    }
+
+    /// Execute timed buy order - places GTC, waits, then cancels unfilled portion
+    /// Returns fill info for any portion that was filled
+    pub async fn buy_timed(&self, token_id: &str, price: f64, size: f64, wait_ms: u64) -> Result<PolyFillAsync> {
+        if size < 1.0 {
+            return Err(anyhow!("size must be >= 1, got {}", size));
+        }
+
+        // Place GTC order
+        let result = self.execute_order_with_type(token_id, price, size, "BUY", PolyOrderType::GTC).await?;
+        let price_cents = (price * 100.0).round() as i64;
+
+        // If fully filled immediately, no need to wait/cancel
+        if result.filled_size >= size {
+            info!("[TIMED] @{}¢ filled immediately: {:.1}/{:.1}", price_cents, result.filled_size, size);
+            return Ok(result);
+        }
+
+        // If order_id is empty, order was rejected (no liquidity etc)
+        if result.order_id.is_empty() {
+            info!("[TIMED] @{}¢ rejected (no order_id) - partial fill: {:.1}", price_cents, result.filled_size);
+            return Ok(result);
+        }
+
+        info!("[TIMED] @{}¢ resting order_id={} partial={:.1}/{:.1}, waiting {}ms...",
+              price_cents, &result.order_id[..8.min(result.order_id.len())], result.filled_size, size, wait_ms);
+
+        // Wait for potential fills
+        tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+
+        // Check current fill status
+        let order_info = self.inner.get_order_async(&result.order_id, &self.creds).await?;
+        let filled_size: f64 = order_info.size_matched.parse().unwrap_or(0.0);
+        let order_price: f64 = order_info.price.parse().unwrap_or(price);
+
+        info!("[TIMED] @{}¢ after {}ms: status={} filled={:.1}/{:.1}",
+              price_cents, wait_ms, order_info.status, filled_size, size);
+
+        // Cancel remaining if not fully filled
+        if order_info.status != "MATCHED" && order_info.status != "matched" {
+            info!("[TIMED] @{}¢ cancelling unfilled portion", price_cents);
+            let _ = self.inner.cancel_order_async(&result.order_id, &self.creds).await;
+        }
+
+        Ok(PolyFillAsync {
+            order_id: result.order_id,
+            filled_size,
+            fill_cost: filled_size * order_price,
+        })
     }
 
     async fn execute_order(&self, token_id: &str, price: f64, size: f64, side: &str) -> Result<PolyFillAsync> {
@@ -657,7 +835,6 @@ impl SharedAsyncClient {
             let body = resp.text().await.unwrap_or_default();
             // FAK orders with no liquidity return 400 - this is expected, not an error
             if body.contains("no orders found to match") {
-                info!("[POLY] No liquidity at price - FAK killed");
                 return Ok(PolyFillAsync {
                     order_id: String::new(),
                     filled_size: 0.0,
@@ -681,11 +858,17 @@ impl SharedAsyncClient {
 
         // If order was matched immediately, use response data directly
         if status == "matched" && success {
-            // API returns amounts already in human units (contracts, dollars)
-            let filled_size: f64 = taking_amount.parse().unwrap_or(0.0);
-            let cost: f64 = making_amount.parse().unwrap_or(0.0);
-            let price_per_share_cents = if filled_size > 0.0 { (cost / filled_size * 100.0).round() as i64 } else { 0 };
-            info!("[POLY] ✅ {} {:.1} @{}¢ (total ${:.2})", side, filled_size, price_per_share_cents, cost);
+            // API returns: BUY = taking(contracts), making(USDC)
+            //              SELL = taking(USDC), making(contracts)
+            let (filled_size, cost) = if side == "SELL" {
+                let contracts: f64 = making_amount.parse().unwrap_or(0.0);
+                let usdc: f64 = taking_amount.parse().unwrap_or(0.0);
+                (contracts, usdc)
+            } else {
+                let contracts: f64 = taking_amount.parse().unwrap_or(0.0);
+                let usdc: f64 = making_amount.parse().unwrap_or(0.0);
+                (contracts, usdc)
+            };
             return Ok(PolyFillAsync {
                 order_id,
                 filled_size,
@@ -697,13 +880,6 @@ impl SharedAsyncClient {
         let order_info = self.inner.get_order_async(&order_id, &self.creds).await?;
         let filled_size: f64 = order_info.size_matched.parse().unwrap_or(0.0);
         let order_price: f64 = order_info.price.parse().unwrap_or(price);
-
-        if filled_size > 0.0 {
-            let price_per_share_cents = (order_price * 100.0).round() as i64;
-            info!("[POLY] ✅ {} {:.1} @{}¢ (total ${:.2})", side, filled_size, price_per_share_cents, filled_size * order_price);
-        } else {
-            tracing::debug!("[POLY] No fill (status={})", order_info.status);
-        }
 
         Ok(PolyFillAsync {
             order_id,
